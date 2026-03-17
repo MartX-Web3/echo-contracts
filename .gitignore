@@ -1,0 +1,30 @@
+# Foundry
+out/
+cache/
+broadcast/
+deployments/
+snapshots/
+gas-snapshots/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node / JS tooling (if used)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Coverage / reports
+coverage/
+lcov.info
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

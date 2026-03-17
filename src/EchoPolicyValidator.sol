@@ -4,6 +4,12 @@ pragma solidity ^0.8.24;
 import "./interfaces/IPolicyRegistry.sol";
 import "./interfaces/IIntentRegistry.sol";
 
+/// @dev Minimal Ownable interface — OZ AccountERC7579 inherits Ownable.
+///      Used in onInstall to verify the smart account is owned by inst.owner.
+interface IOwnable {
+    function owner() external view returns (address);
+}
+
 /// @dev Minimal ERC-4337 UserOperation struct (EntryPoint v0.7).
 struct PackedUserOperation {
     address sender;
@@ -104,13 +110,27 @@ contract EchoPolicyValidator {
         bytes32 instanceId = abi.decode(data, (bytes32));
         require(instanceId != bytes32(0), "onInstall: zero instanceId");
 
-        // SECURITY (CRITICAL-1): msg.sender must be the PolicyInstance owner.
-        // Without this, any address could bind itself to someone else's instanceId
-        // and drain their budget. In ERC-7579, onInstall is called by the smart
-        // account itself (msg.sender = the account), so we verify the account
-        // is the registered owner of the PolicyInstance it is installing.
+        // SECURITY (CRITICAL-1): the smart account calling onInstall must be
+        // owned (via Ownable.owner()) by the same address that owns the
+        // PolicyInstance (inst.owner = user EOA wallet).
+        //
+        // Why not check msg.sender == inst.owner directly?
+        //   inst.owner = user EOA wallet
+        //   msg.sender = smart account address (different)
+        //   Direct check would always fail.
+        //
+        // Why not skip the check?
+        //   Without it, an attacker can bind their account to victim's instanceId
+        //   and exhaust the victim's daily/total budget counters (DoS).
+        //   No token theft occurs (tokens stay in victim's account), but the
+        //   victim's policy becomes unusable.
+        //
+        // The correct check: the smart account's owner (OZ Ownable) must match
+        //   the PolicyInstance owner. Attacker's account has owner = attacker,
+        //   which will not match inst.owner = victim EOA. Attack blocked.
         IPolicyRegistry.PolicyInstance memory inst = registry.getInstance(instanceId);
-        require(inst.owner == msg.sender, "onInstall: not instance owner");
+        address accountOwner = IOwnable(msg.sender).owner();
+        require(accountOwner == inst.owner, "onInstall: account owner mismatch");
 
         _accountInstance[msg.sender] = instanceId;
     }
@@ -181,75 +201,54 @@ contract EchoPolicyValidator {
             return SIG_FAILED;
         }
 
-        (
-            ,
-            uint256 explorationBudget,
-            uint256 explorationPerTx,
-            uint256 explorationSpent,
-            uint256 globalMaxPerDay,
-            uint256 globalTotalBudget,
-            uint256 globalTotalSpent,
-            uint256 globalDailySpent,
-            uint256 lastOpDay,
-            uint256 lastOpTimestamp,
-            uint64  expiry,
-            bool    paused
-        ) = registry.getInstanceForValidation(instanceId);
+        IPolicyRegistry.InstanceValidation memory instV = registry.getInstanceValidation(instanceId);
 
         // Check 2 — Not paused
-        if (paused) {
+        if (instV.paused) {
             emit ValidationFailed(account, instanceId, "Instance paused");
             return SIG_FAILED;
         }
 
         // Check 3 — Not expired
-        if (block.timestamp >= uint256(expiry)) {
+        if (block.timestamp >= uint256(instV.expiry)) {
             emit ValidationFailed(account, instanceId, "Instance expired");
             return SIG_FAILED;
         }
 
         // Check 4 — Anti-replay
-        if (block.timestamp <= lastOpTimestamp) {
+        if (block.timestamp <= instV.lastOpTimestamp) {
             emit ValidationFailed(account, instanceId, "Anti-replay: too fast");
             return SIG_FAILED;
         }
 
-        // Check 5 — Extract target and inner calldata from outer execute() call
-        address target = _extractTarget(userOp.callData);
-        if (target == address(0)) {
-            emit ValidationFailed(account, instanceId, "Cannot extract target");
-            return SIG_FAILED;
-        }
-
-        // Check 6 — Target in allowedTargets
-        if (!registry.isAllowedTarget(instanceId, target)) {
-            emit ValidationFailed(account, instanceId, "Target not allowed");
-            return SIG_FAILED;
-        }
-
-        // Extract inner swap calldata and decode
         bytes calldata innerData = _extractInnerCalldata(userOp.callData);
+
+        // Check 5 & 6 — Extract target and validate allowedTargets
+        {
+            address target = _extractTarget(userOp.callData);
+            if (target == address(0)) {
+                emit ValidationFailed(account, instanceId, "Cannot extract target");
+                return SIG_FAILED;
+            }
+            if (!registry.isAllowedTarget(instanceId, target)) {
+                emit ValidationFailed(account, instanceId, "Target not allowed");
+                return SIG_FAILED;
+            }
+        }
 
         // Check 7 — Selector in allowedSelectors
         if (innerData.length < 4) {
             emit ValidationFailed(account, instanceId, "Inner calldata too short");
             return SIG_FAILED;
         }
-        bytes4 selector = bytes4(innerData[:4]);
-        if (!registry.isAllowedSelector(instanceId, selector)) {
+        if (!registry.isAllowedSelector(instanceId, bytes4(innerData[:4]))) {
             emit ValidationFailed(account, instanceId, "Selector not allowed");
             return SIG_FAILED;
         }
 
         // Decode inner calldata via IntentRegistry
-        (
-            address tokenIn,
-            address tokenOut,
-            uint256 amountIn,
-            address recipient
-        ) = _safeDecode(innerData);
-
-        if (tokenIn == address(0)) {
+        (address tokenOut, uint256 amountIn, address recipient) = _decodeRealtime(innerData);
+        if (tokenOut == address(0)) {
             emit ValidationFailed(account, instanceId, "Calldata decode failed");
             return SIG_FAILED;
         }
@@ -261,51 +260,46 @@ contract EchoPolicyValidator {
         }
 
         // Check 9 & 10 — Token limits or exploration
-        (
-            uint256 tokenMaxPerOp,
-            uint256 tokenMaxPerDay,
-            uint256 tokenDailySpent,
-            uint256 tokenLastOpDay
-        ) = registry.getTokenLimitForValidation(instanceId, tokenOut);
+        IPolicyRegistry.TokenLimitValidation memory tlV = registry.getTokenLimitValidation(instanceId, tokenOut);
 
-        bool isExploration = (tokenMaxPerOp == 0);
+        bool isExploration = (tlV.maxPerOp == 0);
 
         if (isExploration) {
-            if (explorationBudget == 0) {
+            if (instV.explorationBudget == 0) {
                 emit ValidationFailed(account, instanceId, "Token not permitted");
                 return SIG_FAILED;
             }
-            if (amountIn > explorationPerTx) {
+            if (amountIn > instV.explorationPerTx) {
                 emit ValidationFailed(account, instanceId, "Exceeds exploration per-tx");
                 return SIG_FAILED;
             }
-            if (explorationSpent + amountIn > explorationBudget) {
+            if (instV.explorationSpent + amountIn > instV.explorationBudget) {
                 emit ValidationFailed(account, instanceId, "Exploration budget exhausted");
                 return SIG_FAILED;
             }
         } else {
-            if (amountIn > tokenMaxPerOp) {
+            if (amountIn > tlV.maxPerOp) {
                 emit ValidationFailed(account, instanceId, "Exceeds token per-op limit");
                 return SIG_FAILED;
             }
-            uint256 effectiveTokenDaily = (tokenLastOpDay == block.timestamp / SECONDS_PER_DAY)
-                ? tokenDailySpent : 0;
-            if (effectiveTokenDaily + amountIn > tokenMaxPerDay) {
+            uint256 effectiveTokenDaily = (tlV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
+                ? tlV.dailySpent : 0;
+            if (effectiveTokenDaily + amountIn > tlV.maxPerDay) {
                 emit ValidationFailed(account, instanceId, "Exceeds token daily limit");
                 return SIG_FAILED;
             }
         }
 
         // Check 11 — Global daily cap
-        uint256 effectiveGlobalDaily = (lastOpDay == block.timestamp / SECONDS_PER_DAY)
-            ? globalDailySpent : 0;
-        if (effectiveGlobalDaily + amountIn > globalMaxPerDay) {
+        uint256 effectiveGlobalDaily = (instV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
+            ? instV.globalDailySpent : 0;
+        if (effectiveGlobalDaily + amountIn > instV.globalMaxPerDay) {
             emit ValidationFailed(account, instanceId, "Exceeds global daily limit");
             return SIG_FAILED;
         }
 
         // Check 12 — Global total budget (S3)
-        if (globalTotalSpent + amountIn > globalTotalBudget) {
+        if (instV.globalTotalSpent + amountIn > instV.globalTotalBudget) {
             emit ValidationFailed(account, instanceId, "Global budget exhausted");
             return SIG_FAILED;
         }
@@ -313,6 +307,17 @@ contract EchoPolicyValidator {
         registry.recordSpend(instanceId, bytes32(0), tokenOut, amountIn, isExploration);
         emit ValidationPassed(account, instanceId, bytes32(0), tokenOut, amountIn, isExploration);
         return SIG_SUCCESS;
+    }
+
+    /// @dev Decode inner calldata for real-time mode.
+    ///      Real-time validation only needs (tokenOut, amountIn, recipient).
+    function _decodeRealtime(bytes calldata innerData)
+        private
+        view
+        returns (address tokenOut, uint256 amountIn, address recipient)
+    {
+        (, address _tokenOut, uint256 _amountIn, address _recipient) = _safeDecode(innerData);
+        return (_tokenOut, _amountIn, _recipient);
     }
 
     // ── Session mode: 12 checks ────────────────────────────────────────────
@@ -326,169 +331,144 @@ contract EchoPolicyValidator {
         bytes32 sessionId  = bytes32(userOp.signature[1:33]);
         bytes32 rawSessKey = bytes32(userOp.signature[33:65]);
 
-        (
-            bytes32 sessInstanceId,
-            bytes32 sessionKeyHash,
-            address sessTokenIn,
-            address sessTokenOut,
-            uint256 sessMaxPerOp,
-            uint256 sessTotalBudget,
-            uint256 sessTotalSpent,
-            uint256 sessMaxOpsPerDay,
-            uint256 sessDailyOps,
-            uint256 sessLastOpDay,
-            uint64  sessExpiry,
-            bool    sessActive
-        ) = registry.getSessionForValidation(sessionId);
+        IPolicyRegistry.SessionValidation memory sessV =
+            registry.getSessionValidation(sessionId);
 
         // Check 1 — Session Key valid
-        if (keccak256(abi.encode(rawSessKey)) != sessionKeyHash) {
+        if (keccak256(abi.encode(rawSessKey)) != sessV.sessionKeyHash) {
             emit ValidationFailed(account, instanceId, "Session Key invalid");
             return SIG_FAILED;
         }
 
         // Check 2 — Session belongs to this instance
-        if (sessInstanceId != instanceId) {
+        if (sessV.instanceId != instanceId) {
             emit ValidationFailed(account, instanceId, "Session instance mismatch");
             return SIG_FAILED;
         }
 
         // Check 3 — Session active
-        if (!sessActive) {
+        if (!sessV.active) {
             emit ValidationFailed(account, instanceId, "Session revoked");
             return SIG_FAILED;
         }
 
         // Check 4 — Session not expired
-        if (block.timestamp >= uint256(sessExpiry)) {
+        if (block.timestamp >= uint256(sessV.sessionExpiry)) {
             emit ValidationFailed(account, instanceId, "Session expired");
             return SIG_FAILED;
         }
 
-        // Extract target and inner calldata from outer execute() call
-        address target = _extractTarget(userOp.callData);
-        if (target == address(0)) {
-            emit ValidationFailed(account, instanceId, "Cannot extract target");
-            return SIG_FAILED;
-        }
-
-        // SECURITY (CRITICAL-2): session mode must also enforce allowedTargets
-        // and allowedSelectors. Without this, a compromised agent with a session
-        // key could call ANY contract, not just whitelisted DeFi protocols.
-        if (!registry.isAllowedTarget(instanceId, target)) {
-            emit ValidationFailed(account, instanceId, "Target not allowed");
-            return SIG_FAILED;
-        }
-
-        bytes calldata innerData = _extractInnerCalldata(userOp.callData);
-
-        if (innerData.length < 4) {
-            emit ValidationFailed(account, instanceId, "Inner calldata too short");
-            return SIG_FAILED;
-        }
-        bytes4 selector = bytes4(innerData[:4]);
-        if (!registry.isAllowedSelector(instanceId, selector)) {
-            emit ValidationFailed(account, instanceId, "Selector not allowed");
-            return SIG_FAILED;
-        }
-
-        // Check 5 — Decode inner calldata
-        (
-            address tokenIn,
-            address tokenOut,
-            uint256 amountIn,
-            address recipient
-        ) = _safeDecode(innerData);
-
-        if (tokenIn == address(0)) {
-            emit ValidationFailed(account, instanceId, "Calldata decode failed");
-            return SIG_FAILED;
-        }
-
-        // Check 6 — tokenIn matches session
-        if (tokenIn != sessTokenIn) {
-            emit ValidationFailed(account, instanceId, "tokenIn mismatch");
-            return SIG_FAILED;
-        }
-
-        // Check 7 — tokenOut matches session
-        if (tokenOut != sessTokenOut) {
-            emit ValidationFailed(account, instanceId, "tokenOut mismatch");
-            return SIG_FAILED;
-        }
-
-        // Check 8 — Recipient must be this account (S2)
-        if (recipient != account) {
-            emit ValidationFailed(account, instanceId, "Recipient not account");
-            return SIG_FAILED;
-        }
-
-        // Check 9 — Amount within session per-op limit
-        if (amountIn > sessMaxPerOp) {
-            emit ValidationFailed(account, instanceId, "Exceeds session per-op limit");
-            return SIG_FAILED;
-        }
-
-        // Check 10 — Session total budget (S3)
-        if (sessTotalSpent + amountIn > sessTotalBudget) {
-            emit ValidationFailed(account, instanceId, "Session budget exhausted");
-            return SIG_FAILED;
-        }
-
-        // Check 11 — Session daily ops limit
-        uint256 effectiveDailyOps = (sessLastOpDay == block.timestamp / SECONDS_PER_DAY)
-            ? sessDailyOps : 0;
-        if (effectiveDailyOps + 1 > sessMaxOpsPerDay) {
-            emit ValidationFailed(account, instanceId, "Session daily ops limit reached");
-            return SIG_FAILED;
-        }
+        (uint256 amountIn, bool ok) = _checkSessionCalldataAndLimits(
+            account,
+            instanceId,
+            userOp.callData,
+            sessV
+        );
+        if (!ok) return SIG_FAILED;
 
         // Check 12 — MetaPolicy global caps (re-verified)
-        (
-            ,
-            ,
-            ,
-            ,
-            uint256 globalMaxPerDay,
-            uint256 globalTotalBudget,
-            uint256 globalTotalSpent,
-            uint256 globalDailySpent,
-            uint256 lastOpDay,
-            uint256 lastOpTimestamp,
-            uint64  instExpiry,
-            bool    paused
-        ) = registry.getInstanceForValidation(instanceId);
+        IPolicyRegistry.InstanceValidation memory instV =
+            registry.getInstanceValidation(instanceId);
 
-        if (paused) {
+        if (instV.paused) {
             emit ValidationFailed(account, instanceId, "Instance paused");
             return SIG_FAILED;
         }
-        if (block.timestamp >= uint256(instExpiry)) {
+        if (block.timestamp >= uint256(instV.expiry)) {
             emit ValidationFailed(account, instanceId, "Instance expired");
             return SIG_FAILED;
         }
-        if (block.timestamp <= lastOpTimestamp) {
+        if (block.timestamp <= instV.lastOpTimestamp) {
             emit ValidationFailed(account, instanceId, "Anti-replay: too fast");
             return SIG_FAILED;
         }
 
-        uint256 effectiveGlobalDaily = (lastOpDay == block.timestamp / SECONDS_PER_DAY)
-            ? globalDailySpent : 0;
-        if (effectiveGlobalDaily + amountIn > globalMaxPerDay) {
+        uint256 effectiveGlobalDaily = (instV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
+            ? instV.globalDailySpent : 0;
+        if (effectiveGlobalDaily + amountIn > instV.globalMaxPerDay) {
             emit ValidationFailed(account, instanceId, "Exceeds global daily limit");
             return SIG_FAILED;
         }
-        if (globalTotalSpent + amountIn > globalTotalBudget) {
+        if (instV.globalTotalSpent + amountIn > instV.globalTotalBudget) {
             emit ValidationFailed(account, instanceId, "Global budget exhausted");
             return SIG_FAILED;
         }
 
-        (uint256 tokenMaxPerOp,,,) = registry.getTokenLimitForValidation(instanceId, sessTokenOut);
-        bool isExploration = (tokenMaxPerOp == 0);
+        IPolicyRegistry.TokenLimitValidation memory tlV =
+            registry.getTokenLimitValidation(instanceId, sessV.tokenOut);
+        bool isExploration = (tlV.maxPerOp == 0);
 
-        registry.recordSpend(instanceId, sessionId, sessTokenOut, amountIn, isExploration);
-        emit ValidationPassed(account, instanceId, sessionId, sessTokenOut, amountIn, isExploration);
+        registry.recordSpend(instanceId, sessionId, sessV.tokenOut, amountIn, isExploration);
+        emit ValidationPassed(account, instanceId, sessionId, sessV.tokenOut, amountIn, isExploration);
         return SIG_SUCCESS;
+    }
+
+    /// @dev Session checks 5–11: target/selector checks + decode + session constraints.
+    ///      Emits ValidationFailed and returns (0,false) on failure.
+    function _checkSessionCalldataAndLimits(
+        address account,
+        bytes32 instanceId,
+        bytes calldata outerCallData,
+        IPolicyRegistry.SessionValidation memory sessV
+    ) private returns (uint256 amountIn, bool ok) {
+        // Extract target and enforce allowedTargets (CRITICAL-2)
+        address target = _extractTarget(outerCallData);
+        if (target == address(0)) {
+            emit ValidationFailed(account, instanceId, "Cannot extract target");
+            return (0, false);
+        }
+        if (!registry.isAllowedTarget(instanceId, target)) {
+            emit ValidationFailed(account, instanceId, "Target not allowed");
+            return (0, false);
+        }
+
+        bytes calldata innerData = _extractInnerCalldata(outerCallData);
+        if (innerData.length < 4) {
+            emit ValidationFailed(account, instanceId, "Inner calldata too short");
+            return (0, false);
+        }
+        if (!registry.isAllowedSelector(instanceId, bytes4(innerData[:4]))) {
+            emit ValidationFailed(account, instanceId, "Selector not allowed");
+            return (0, false);
+        }
+
+        (address tokenIn, address tokenOut, uint256 amt, address recipient) = _safeDecode(innerData);
+        if (tokenIn == address(0)) {
+            emit ValidationFailed(account, instanceId, "Calldata decode failed");
+            return (0, false);
+        }
+        if (tokenIn != sessV.tokenIn) {
+            emit ValidationFailed(account, instanceId, "tokenIn mismatch");
+            return (0, false);
+        }
+        if (tokenOut != sessV.tokenOut) {
+            emit ValidationFailed(account, instanceId, "tokenOut mismatch");
+            return (0, false);
+        }
+        if (recipient != account) {
+            emit ValidationFailed(account, instanceId, "Recipient not account");
+            return (0, false);
+        }
+
+        amountIn = amt;
+
+        if (amountIn > sessV.maxAmountPerOp) {
+            emit ValidationFailed(account, instanceId, "Exceeds session per-op limit");
+            return (0, false);
+        }
+        if (sessV.totalSpent + amountIn > sessV.totalBudget) {
+            emit ValidationFailed(account, instanceId, "Session budget exhausted");
+            return (0, false);
+        }
+
+        uint256 effectiveDailyOps = (sessV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
+            ? sessV.dailyOps : 0;
+        if (effectiveDailyOps + 1 > sessV.maxOpsPerDay) {
+            emit ValidationFailed(account, instanceId, "Session daily ops limit reached");
+            return (0, false);
+        }
+
+        return (amountIn, true);
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────

@@ -64,6 +64,64 @@ interface IPolicyRegistry {
         bool     exists;
     }
 
+    /// @notice Bundle of parameters for registering a PolicyInstance.
+    /// @dev    Exists to avoid "stack too deep" in callers that need to forward
+    ///         many dynamic arrays (e.g. EchoAccountFactory).
+    struct InstanceRegistration {
+        address   owner;
+        bytes32   templateId;
+        bytes32   executeKeyHash;
+        address[] initialTokens;
+        uint256[] maxPerOps;
+        uint256[] maxPerDays;
+        address[] targets;
+        bytes4[]  selectors;
+        uint256   explorationBudget;
+        uint256   explorationPerTx;
+        uint256   globalMaxPerDay;
+        uint256   globalTotalBudget;
+        uint64    expiry;
+    }
+
+    /// @notice Minimal instance fields needed during validation.
+    struct InstanceValidation {
+        uint256 explorationBudget;
+        uint256 explorationPerTx;
+        uint256 explorationSpent;
+        uint256 globalMaxPerDay;
+        uint256 globalTotalBudget;
+        uint256 globalTotalSpent;
+        uint256 globalDailySpent;
+        uint256 lastOpDay;
+        uint256 lastOpTimestamp;
+        uint64  expiry;
+        bool    paused;
+    }
+
+    /// @notice Minimal session fields needed during validation.
+    struct SessionValidation {
+        bytes32 instanceId;
+        bytes32 sessionKeyHash;
+        address tokenIn;
+        address tokenOut;
+        uint256 maxAmountPerOp;
+        uint256 totalBudget;
+        uint256 totalSpent;
+        uint256 maxOpsPerDay;
+        uint256 dailyOps;
+        uint256 lastOpDay;
+        uint64  sessionExpiry;
+        bool    active;
+    }
+
+    /// @notice Minimal token limit fields needed during validation.
+    struct TokenLimitValidation {
+        uint256 maxPerOp;
+        uint256 maxPerDay;
+        uint256 dailySpent;
+        uint256 lastOpDay;
+    }
+
     // ── Events ─────────────────────────────────────────────────────────────
 
     event TemplateCreated(bytes32 indexed templateId, string name, address creator);
@@ -104,40 +162,16 @@ interface IPolicyRegistry {
     // ── Instance ───────────────────────────────────────────────────────────
 
     /// @notice Register an instance where msg.sender becomes owner.
-    ///         Used when the user calls directly (e.g. from Dashboard).
-    function registerInstance(
-        bytes32   templateId,
-        bytes32   executeKeyHash,
-        address[] calldata initialTokens,
-        uint256[] calldata maxPerOps,
-        uint256[] calldata maxPerDays,
-        address[] calldata targets,
-        bytes4[]  calldata selectors,
-        uint256   explorationBudget,
-        uint256   explorationPerTx,
-        uint256   globalMaxPerDay,
-        uint256   globalTotalBudget,
-        uint64    expiry
+    /// @dev    Uses a struct bundle to avoid stack-too-deep in callers.
+    ///         Implementations should enforce r.owner == msg.sender.
+    function registerInstanceStruct(
+        InstanceRegistration calldata r
     ) external returns (bytes32 instanceId);
 
-    /// @notice Register an instance on behalf of `owner`.
-    ///         Only callable by EchoAccountFactory (onlyFactory).
-    ///         Used in one-tx account creation so the user is the owner,
-    ///         not the Factory contract.
-    function registerInstanceFor(
-        address   owner,
-        bytes32   templateId,
-        bytes32   executeKeyHash,
-        address[] calldata initialTokens,
-        uint256[] calldata maxPerOps,
-        uint256[] calldata maxPerDays,
-        address[] calldata targets,
-        bytes4[]  calldata selectors,
-        uint256   explorationBudget,
-        uint256   explorationPerTx,
-        uint256   globalMaxPerDay,
-        uint256   globalTotalBudget,
-        uint64    expiry
+    /// @notice Register an instance on behalf of `InstanceRegistration.owner`.
+    /// @dev    Only callable by EchoAccountFactory (onlyFactory).
+    function registerInstanceForStruct(
+        InstanceRegistration calldata r
     ) external returns (bytes32 instanceId);
 
     function setTokenLimit(bytes32 instanceId, address token, uint256 maxPerOp, uint256 maxPerDay) external;
@@ -205,12 +239,21 @@ interface IPolicyRegistry {
         bool    paused
     );
 
+    /// @notice Struct-return version of instance validation data.
+    function getInstanceValidation(bytes32 instanceId) external view returns (InstanceValidation memory v);
+
     function getTokenLimitForValidation(bytes32 instanceId, address token) external view returns (
         uint256 maxPerOp,
         uint256 maxPerDay,
         uint256 dailySpent,
         uint256 lastOpDay
     );
+
+    /// @notice Struct-return version of token limit validation data.
+    function getTokenLimitValidation(bytes32 instanceId, address token)
+        external
+        view
+        returns (TokenLimitValidation memory v);
 
     function getSessionForValidation(bytes32 sessionId) external view returns (
         bytes32 instanceId,
@@ -226,4 +269,7 @@ interface IPolicyRegistry {
         uint64  sessionExpiry,
         bool    active
     );
+
+    /// @notice Struct-return version of session validation data.
+    function getSessionValidation(bytes32 sessionId) external view returns (SessionValidation memory v);
 }

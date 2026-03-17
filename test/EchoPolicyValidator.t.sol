@@ -13,6 +13,7 @@ import "../src/interfaces/IPolicyRegistry.sol";
 contract MockAccount {
     EchoPolicyValidator public validator;
     constructor(EchoPolicyValidator _v) { validator = _v; }
+    function owner() external view returns (address) { return address(this); }
     function installValidator(bytes memory data) external { validator.onInstall(data); }
     function uninstallValidator() external { validator.onUninstall(""); }
     function validate(PackedUserOperation calldata op) external returns (uint256) {
@@ -69,12 +70,22 @@ contract EchoPolicyValidatorTest is Test {
         bytes4[]  memory sels    = _s2(EIS, EOS);
 
         vm.prank(address(account));
-        instanceId = registry.registerInstance(
-            templateId, execKeyHash,
-            tokens, perOps, perDays,
-            targets, sels,
-            50e6, 10e6, 1000e6, 5000e6,
-            uint64(block.timestamp + 90 * DAY)
+        instanceId = registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             address(account),
+                templateId:         templateId,
+                executeKeyHash:     execKeyHash,
+                initialTokens:      tokens,
+                maxPerOps:          perOps,
+                maxPerDays:         perDays,
+                targets:            targets,
+                selectors:          sels,
+                explorationBudget:  50e6,
+                explorationPerTx:   10e6,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + 90 * DAY)
+            })
         );
 
         vm.prank(address(account));
@@ -296,11 +307,15 @@ contract EchoPolicyValidatorTest is Test {
     // Check 11: exceeds global daily limit
     function test_RT_check11_exceedsGlobalDaily_fails() public {
         // WETH daily 500, WBTC daily 300, global daily 1000
+        // Raise WBTC daily cap so global cap becomes the binding constraint.
+        vm.prank(address(account));
+        registry.setTokenLimit(instanceId, WBTC, 100e6, 1000e6);
+
         // Max out WETH (5 ops × 100)
         bytes memory cdW = _validCD(USDC, WETH, 100e6);
         PackedUserOperation memory opW = _op(cdW, _rtSig(rawExecKey));
         for (uint i = 0; i < 5; i++) { _pass(account.validate(opW), "weth"); vm.warp(block.timestamp+1); }
-        // Max out WBTC (5 ops × 100 = 500, global now 1000)
+        // Spend WBTC (5 ops × 100 = 500, global now 1000)
         bytes memory cdB = _validCD(USDC, WBTC, 100e6);
         PackedUserOperation memory opB = _op(cdB, _rtSig(rawExecKey));
         for (uint i = 0; i < 5; i++) { _pass(account.validate(opB), "wbtc"); vm.warp(block.timestamp+1); }
@@ -485,7 +500,7 @@ contract EchoPolicyValidatorTest is Test {
         // attacker tries to bind their account to victim's instanceId
         MockAccount attacker = new MockAccount(validator);
         vm.prank(address(attacker));
-        vm.expectRevert("onInstall: not instance owner");
+        vm.expectRevert("onInstall: account owner mismatch");
         attacker.installValidator(abi.encode(instanceId));
     }
 
@@ -502,7 +517,7 @@ contract EchoPolicyValidatorTest is Test {
 
         // Attacker tries to install with victim's instanceId
         vm.prank(address(attacker));
-        vm.expectRevert("onInstall: not instance owner");
+        vm.expectRevert("onInstall: account owner mismatch");
         attacker.installValidator(abi.encode(instanceId));
 
         // Attacker has no instance bound

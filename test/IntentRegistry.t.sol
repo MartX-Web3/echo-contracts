@@ -128,7 +128,7 @@ contract IntentRegistryTest is Test {
         );
     }
 
-    function test_decode_exactInputSingle_basic() public view {
+    function test_decode_exactInputSingle_basic() public {
         address myRecipient = makeAddr("recipient");
         bytes memory data = _buildExactInputSingle(
             USDC, WETH, 3000, myRecipient, block.timestamp, 100e6, 0, 0
@@ -142,7 +142,7 @@ contract IntentRegistryTest is Test {
         assertEq(rec,  myRecipient);
     }
 
-    function test_decode_exactInputSingle_large_amount() public view {
+    function test_decode_exactInputSingle_large_amount() public {
         address myRecipient = makeAddr("recipient");
         uint256 largeAmount = 1_000_000e6; // 1M USDC
         bytes memory data = _buildExactInputSingle(
@@ -157,7 +157,7 @@ contract IntentRegistryTest is Test {
         assertEq(rec,  myRecipient);
     }
 
-    function test_decode_exactInputSingle_different_fee_tiers() public view {
+    function test_decode_exactInputSingle_different_fee_tiers() public {
         // 100, 500, 3000, 10000 are the standard Uniswap V3 fee tiers
         // Fee tier should not affect decoded fields
         address rec = makeAddr("r");
@@ -177,7 +177,7 @@ contract IntentRegistryTest is Test {
 
     // ── decode: exactOutputSingle ──────────────────────────────────────────
 
-    function test_decode_exactOutputSingle_basic() public view {
+    function test_decode_exactOutputSingle_basic() public {
         address myRecipient = makeAddr("recipient");
         // amountOut = 1 WETH, amountInMaximum = 3000 USDC
         bytes memory data = _buildExactOutputSingle(
@@ -192,7 +192,7 @@ contract IntentRegistryTest is Test {
         assertEq(rec,  myRecipient);
     }
 
-    function test_decode_exactOutputSingle_amountInMaximum_used() public view {
+    function test_decode_exactOutputSingle_amountInMaximum_used() public {
         // Verify that for exactOutputSingle, amountInMaximum (offset 196) is returned
         // not amountOut (offset 164)
         address rec = makeAddr("rec");
@@ -350,7 +350,7 @@ contract IntentRegistryTest is Test {
 
     // ── Security: recipient cannot be faked by data manipulation ──────────
 
-    function test_decode_recipient_at_correct_offset() public view {
+    function test_decode_recipient_at_correct_offset() public {
         // Place different address values at different offsets to ensure
         // we're reading recipient from offset 100, not from another field
         address decoy1    = makeAddr("decoy1");    // will be at tokenIn offset (4)

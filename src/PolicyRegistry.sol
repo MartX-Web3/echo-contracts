@@ -123,129 +123,86 @@ contract PolicyRegistry is IPolicyRegistry {
     // ── Instance ───────────────────────────────────────────────────────────
 
     /// @inheritdoc IPolicyRegistry
-    /// @dev msg.sender becomes owner. Used when user calls directly.
-    function registerInstance(
-        bytes32   templateId,
-        bytes32   executeKeyHash,
-        address[] calldata initialTokens,
-        uint256[] calldata maxPerOps,
-        uint256[] calldata maxPerDays,
-        address[] calldata targets,
-        bytes4[]  calldata selectors,
-        uint256   explorationBudget,
-        uint256   explorationPerTx,
-        uint256   globalMaxPerDay,
-        uint256   globalTotalBudget,
-        uint64    expiry
-    ) external returns (bytes32 instanceId) {
-        return _registerInstance(
-            msg.sender, templateId, executeKeyHash,
-            initialTokens, maxPerOps, maxPerDays,
-            targets, selectors,
-            explorationBudget, explorationPerTx,
-            globalMaxPerDay, globalTotalBudget, expiry
-        );
+    function registerInstanceStruct(InstanceRegistration calldata r)
+        external
+        returns (bytes32 instanceId)
+    {
+        require(r.owner == msg.sender, "Owner mismatch");
+        return _registerInstanceStruct(r, msg.sender);
     }
 
     /// @inheritdoc IPolicyRegistry
-    /// @dev `owner` param is the user address. Called by EchoAccountFactory only.
-    function registerInstanceFor(
-        address   instanceOwner,
-        bytes32   templateId,
-        bytes32   executeKeyHash,
-        address[] calldata initialTokens,
-        uint256[] calldata maxPerOps,
-        uint256[] calldata maxPerDays,
-        address[] calldata targets,
-        bytes4[]  calldata selectors,
-        uint256   explorationBudget,
-        uint256   explorationPerTx,
-        uint256   globalMaxPerDay,
-        uint256   globalTotalBudget,
-        uint64    expiry
-    ) external onlyFactory returns (bytes32 instanceId) {
-        require(instanceOwner != address(0), "Zero owner");
-        return _registerInstance(
-            instanceOwner, templateId, executeKeyHash,
-            initialTokens, maxPerOps, maxPerDays,
-            targets, selectors,
-            explorationBudget, explorationPerTx,
-            globalMaxPerDay, globalTotalBudget, expiry
-        );
+    function registerInstanceForStruct(InstanceRegistration calldata r)
+        external
+        onlyFactory
+        returns (bytes32 instanceId)
+    {
+        require(r.owner != address(0), "Zero owner");
+        return _registerInstanceStruct(r, r.owner);
     }
 
-    /// @dev Shared implementation for both registerInstance variants.
-    function _registerInstance(
-        address   instanceOwner,
-        bytes32   templateId,
-        bytes32   executeKeyHash,
-        address[] calldata initialTokens,
-        uint256[] calldata maxPerOps,
-        uint256[] calldata maxPerDays,
-        address[] calldata targets,
-        bytes4[]  calldata selectors,
-        uint256   explorationBudget,
-        uint256   explorationPerTx,
-        uint256   globalMaxPerDay,
-        uint256   globalTotalBudget,
-        uint64    expiry
-    ) internal returns (bytes32 instanceId) {
-        require(_templates[templateId].exists,              "Template not found");
-        require(executeKeyHash != bytes32(0),               "Zero key hash");
-        require(expiry > block.timestamp,                   "Expiry in past");
-        require(initialTokens.length == maxPerOps.length,  "Token array mismatch");
-        require(initialTokens.length == maxPerDays.length, "Token array mismatch");
-        require(globalTotalBudget > 0,                     "Zero global budget");
+    /// @dev Struct-based registration to avoid stack-too-deep in callers.
+    function _registerInstanceStruct(InstanceRegistration calldata r, address instanceOwner)
+        internal
+        returns (bytes32 instanceId)
+    {
+        require(instanceOwner != address(0),                  "Zero owner");
+        require(_templates[r.templateId].exists,              "Template not found");
+        require(r.executeKeyHash != bytes32(0),               "Zero key hash");
+        require(r.expiry > block.timestamp,                   "Expiry in past");
+        require(r.initialTokens.length == r.maxPerOps.length,  "Token array mismatch");
+        require(r.initialTokens.length == r.maxPerDays.length, "Token array mismatch");
+        require(r.globalTotalBudget > 0,                      "Zero global budget");
 
         instanceId = keccak256(abi.encodePacked(
             "inst", ++_instanceNonce, instanceOwner, block.chainid
         ));
 
         _instances[instanceId] = PolicyInstance({
-            templateId:        templateId,
+            templateId:        r.templateId,
             owner:             instanceOwner,
-            executeKeyHash:    executeKeyHash,
-            allowedTargets:    targets,
-            allowedSelectors:  selectors,
-            tokenList:         initialTokens,
-            explorationBudget: explorationBudget,
-            explorationPerTx:  explorationPerTx,
+            executeKeyHash:    r.executeKeyHash,
+            allowedTargets:    r.targets,
+            allowedSelectors:  r.selectors,
+            tokenList:         r.initialTokens,
+            explorationBudget: r.explorationBudget,
+            explorationPerTx:  r.explorationPerTx,
             explorationSpent:  0,
-            globalMaxPerDay:   globalMaxPerDay,
-            globalTotalBudget: globalTotalBudget,
+            globalMaxPerDay:   r.globalMaxPerDay,
+            globalTotalBudget: r.globalTotalBudget,
             globalTotalSpent:  0,
             globalDailySpent:  0,
             lastOpDay:         0,
             lastOpTimestamp:   0,
-            expiry:            expiry,
+            expiry:            r.expiry,
             paused:            false,
             exists:            true
         });
 
-        _executeKeys[instanceId][executeKeyHash] = true;
+        _executeKeys[instanceId][r.executeKeyHash] = true;
 
-        for (uint256 i = 0; i < initialTokens.length; i++) {
-            require(maxPerDays[i] >= maxPerOps[i], "maxPerDay < maxPerOp");
-            _tokenLimits[instanceId][initialTokens[i]] = TokenLimit({
-                maxPerOp:   maxPerOps[i],
-                maxPerDay:  maxPerDays[i],
+        for (uint256 i = 0; i < r.initialTokens.length; i++) {
+            require(r.maxPerDays[i] >= r.maxPerOps[i], "maxPerDay < maxPerOp");
+            _tokenLimits[instanceId][r.initialTokens[i]] = TokenLimit({
+                maxPerOp:   r.maxPerOps[i],
+                maxPerDay:  r.maxPerDays[i],
                 dailySpent: 0,
                 totalSpent: 0,
                 lastOpDay:  0
             });
-            emit TokenLimitSet(instanceId, initialTokens[i], maxPerOps[i], maxPerDays[i]);
+            emit TokenLimitSet(instanceId, r.initialTokens[i], r.maxPerOps[i], r.maxPerDays[i]);
         }
 
-        for (uint256 i = 0; i < targets.length; i++) {
-            _targetAllowed[instanceId][targets[i]] = true;
-            emit TargetAdded(instanceId, targets[i]);
+        for (uint256 i = 0; i < r.targets.length; i++) {
+            _targetAllowed[instanceId][r.targets[i]] = true;
+            emit TargetAdded(instanceId, r.targets[i]);
         }
-        for (uint256 i = 0; i < selectors.length; i++) {
-            _selectorAllowed[instanceId][selectors[i]] = true;
+        for (uint256 i = 0; i < r.selectors.length; i++) {
+            _selectorAllowed[instanceId][r.selectors[i]] = true;
         }
 
-        emit InstanceRegistered(instanceId, instanceOwner, templateId);
-        emit ExecuteKeyIssued(instanceId, executeKeyHash, "initial");
+        emit InstanceRegistered(instanceId, instanceOwner, r.templateId);
+        emit ExecuteKeyIssued(instanceId, r.executeKeyHash, "initial");
     }
 
     // ── Instance field-level updates ───────────────────────────────────────
@@ -543,6 +500,28 @@ contract PolicyRegistry is IPolicyRegistry {
         );
     }
 
+    function getInstanceValidation(bytes32 instanceId)
+        external
+        view
+        returns (InstanceValidation memory v)
+    {
+        PolicyInstance storage inst = _instances[instanceId];
+        require(inst.exists, "Instance not found");
+        return InstanceValidation({
+            explorationBudget: inst.explorationBudget,
+            explorationPerTx:  inst.explorationPerTx,
+            explorationSpent:  inst.explorationSpent,
+            globalMaxPerDay:   inst.globalMaxPerDay,
+            globalTotalBudget: inst.globalTotalBudget,
+            globalTotalSpent:  inst.globalTotalSpent,
+            globalDailySpent:  inst.globalDailySpent,
+            lastOpDay:         inst.lastOpDay,
+            lastOpTimestamp:   inst.lastOpTimestamp,
+            expiry:            inst.expiry,
+            paused:            inst.paused
+        });
+    }
+
     function getTokenLimitForValidation(bytes32 instanceId, address token) external view returns (
         uint256 maxPerOp,
         uint256 maxPerDay,
@@ -551,6 +530,20 @@ contract PolicyRegistry is IPolicyRegistry {
     ) {
         TokenLimit storage tl = _tokenLimits[instanceId][token];
         return (tl.maxPerOp, tl.maxPerDay, tl.dailySpent, tl.lastOpDay);
+    }
+
+    function getTokenLimitValidation(bytes32 instanceId, address token)
+        external
+        view
+        returns (TokenLimitValidation memory v)
+    {
+        TokenLimit storage tl = _tokenLimits[instanceId][token];
+        return TokenLimitValidation({
+            maxPerOp:   tl.maxPerOp,
+            maxPerDay:  tl.maxPerDay,
+            dailySpent: tl.dailySpent,
+            lastOpDay:  tl.lastOpDay
+        });
     }
 
     function getSessionForValidation(bytes32 sessionId) external view returns (
@@ -583,5 +576,28 @@ contract PolicyRegistry is IPolicyRegistry {
             sess.sessionExpiry,
             sess.active
         );
+    }
+
+    function getSessionValidation(bytes32 sessionId)
+        external
+        view
+        returns (SessionValidation memory v)
+    {
+        SessionPolicy storage sess = _sessions[sessionId];
+        require(sess.exists, "Session not found");
+        return SessionValidation({
+            instanceId:     sess.instanceId,
+            sessionKeyHash: sess.sessionKeyHash,
+            tokenIn:        sess.tokenIn,
+            tokenOut:       sess.tokenOut,
+            maxAmountPerOp: sess.maxAmountPerOp,
+            totalBudget:    sess.totalBudget,
+            totalSpent:     sess.totalSpent,
+            maxOpsPerDay:   sess.maxOpsPerDay,
+            dailyOps:       sess.dailyOps,
+            lastOpDay:      sess.lastOpDay,
+            sessionExpiry:  sess.sessionExpiry,
+            active:         sess.active
+        });
     }
 }

@@ -64,16 +64,22 @@ contract PolicyRegistryTest is Test {
 
         bytes32 execKeyHash = keccak256(abi.encode("rawExecuteKey"));
 
-        instanceId = registry.registerInstance(
-            templateId,
-            execKeyHash,
-            tokens, perOps, perDays,
-            targets, sels,
-            50e6,    // explorationBudget
-            10e6,    // explorationPerTx
-            1000e6,  // globalMaxPerDay
-            5000e6,  // globalTotalBudget
-            uint64(block.timestamp + 90 * DAY)
+        instanceId = registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user,
+                templateId:         templateId,
+                executeKeyHash:     execKeyHash,
+                initialTokens:      tokens,
+                maxPerOps:          perOps,
+                maxPerDays:         perDays,
+                targets:            targets,
+                selectors:          sels,
+                explorationBudget:  50e6,
+                explorationPerTx:   10e6,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + 90 * DAY)
+            })
         );
     }
 
@@ -124,7 +130,7 @@ contract PolicyRegistryTest is Test {
         assertEq(tl.totalSpent, 0);
     }
 
-    function test_registerInstance_allowedTargets() public view {
+    function test_registerInstance_allowedTargets() public {
         assertTrue(registry.isAllowedTarget(instanceId, UNI_ROUTER));
         assertTrue(registry.isAllowedSelector(instanceId, EXACT_INPUT_SINGLE));
         assertTrue(registry.isAllowedSelector(instanceId, EXACT_OUTPUT_SINGLE));
@@ -136,7 +142,23 @@ contract PolicyRegistryTest is Test {
         address[] memory t; uint256[] memory p; uint256[] memory d;
         address[] memory tgt; bytes4[] memory sel;
         vm.expectRevert("Template not found");
-        registry.registerInstance(bytes32(0), bytes32(uint256(1)), t,p,d,tgt,sel,0,0,1000,5000,uint64(block.timestamp+1));
+        registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user,
+                templateId:         bytes32(0),
+                executeKeyHash:     bytes32(uint256(1)),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000,
+                globalTotalBudget:  5000,
+                expiry:             uint64(block.timestamp + 1)
+            })
+        );
     }
 
     function test_registerInstance_zeroKeyHash_reverts() public {
@@ -144,7 +166,23 @@ contract PolicyRegistryTest is Test {
         address[] memory t; uint256[] memory p; uint256[] memory d;
         address[] memory tgt; bytes4[] memory sel;
         vm.expectRevert("Zero key hash");
-        registry.registerInstance(templateId, bytes32(0), t,p,d,tgt,sel,0,0,1000,5000,uint64(block.timestamp+1));
+        registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user,
+                templateId:         templateId,
+                executeKeyHash:     bytes32(0),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000,
+                globalTotalBudget:  5000,
+                expiry:             uint64(block.timestamp + 1)
+            })
+        );
     }
 
     function test_registerInstance_expiryInPast_reverts() public {
@@ -152,7 +190,23 @@ contract PolicyRegistryTest is Test {
         address[] memory t; uint256[] memory p; uint256[] memory d;
         address[] memory tgt; bytes4[] memory sel;
         vm.expectRevert("Expiry in past");
-        registry.registerInstance(templateId, keccak256("k"), t,p,d,tgt,sel,0,0,1000,5000,uint64(block.timestamp));
+        registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user,
+                templateId:         templateId,
+                executeKeyHash:     keccak256("k"),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000,
+                globalTotalBudget:  5000,
+                expiry:             uint64(block.timestamp)
+            })
+        );
     }
 
     // ── setTokenLimit ──────────────────────────────────────────────────────
@@ -331,14 +385,22 @@ contract PolicyRegistryTest is Test {
         address[] memory t; uint256[] memory p; uint256[] memory d;
         address[] memory tgt; bytes4[] memory sel;
         vm.prank(user2);
-        bytes32 inst2 = registry.registerInstance(
-            templateId,
-            keccak256("k2"),
-            t, p, d, tgt, sel,
-            0, 0,    // no exploration budget
-            1000e6,
-            5000e6,
-            uint64(block.timestamp + DAY)
+        bytes32 inst2 = registry.registerInstanceStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user2,
+                templateId:         templateId,
+                executeKeyHash:     keccak256("k2"),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + DAY)
+            })
         );
 
         vm.prank(user2);
@@ -514,7 +576,7 @@ contract PolicyRegistryTest is Test {
             "Standard", 100e6, 500e6, 50e6, 10e6, 1000e6, 5000e6, uint64(90 * DAY)
         );
 
-        // Factory calls registerInstanceFor on behalf of userWallet
+        // Factory calls registerInstanceForStruct on behalf of userWallet
         address[] memory tokens  = new address[](1);
         uint256[] memory perOps  = new uint256[](1);
         uint256[] memory perDays = new uint256[](1);
@@ -526,12 +588,22 @@ contract PolicyRegistryTest is Test {
         sels[0] = bytes4(0x414bf389);
 
         vm.prank(mockFactory2);
-        bytes32 iId = reg2.registerInstanceFor(
-            userWallet, tId, keccak256("key"),
-            tokens, perOps, perDays,
-            targets, sels,
-            50e6, 10e6, 1000e6, 5000e6,
-            uint64(block.timestamp + DAY)
+        bytes32 iId = reg2.registerInstanceForStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             userWallet,
+                templateId:         tId,
+                executeKeyHash:     keccak256("key"),
+                initialTokens:      tokens,
+                maxPerOps:          perOps,
+                maxPerDays:         perDays,
+                targets:            targets,
+                selectors:          sels,
+                explorationBudget:  50e6,
+                explorationPerTx:   10e6,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + DAY)
+            })
         );
 
         // Owner must be userWallet, not factory
@@ -546,11 +618,22 @@ contract PolicyRegistryTest is Test {
 
         vm.prank(makeAddr("notFactory"));
         vm.expectRevert("Not factory");
-        registry.registerInstanceFor(
-            makeAddr("user"), templateId, keccak256("k"),
-            t, p, d, tgt, sel,
-            0, 0, 1000e6, 5000e6,
-            uint64(block.timestamp + DAY)
+        registry.registerInstanceForStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             makeAddr("user"),
+                templateId:         templateId,
+                executeKeyHash:     keccak256("k"),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + DAY)
+            })
         );
     }
 
@@ -570,11 +653,22 @@ contract PolicyRegistryTest is Test {
 
         vm.prank(mockFactory2);
         vm.expectRevert("Zero owner");
-        reg2.registerInstanceFor(
-            address(0), tId, keccak256("k"),
-            t, p, d, tgt, sel,
-            0, 0, 1000e6, 5000e6,
-            uint64(block.timestamp + DAY)
+        reg2.registerInstanceForStruct(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             address(0),
+                templateId:         tId,
+                executeKeyHash:     keccak256("k"),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + DAY)
+            })
         );
     }
 
@@ -633,7 +727,11 @@ contract PolicyRegistryTest is Test {
             uint256 maxPerOp,
             uint256 budget,
             uint256 spent,
-            ,,,, uint64 exp, bool active
+            , // maxOpsPerDay
+            , // dailyOps
+            , // lastOpDay
+            uint64 exp,
+            bool active
         ) = registry.getSessionForValidation(sessionId);
 
         assertEq(instId,       instanceId);
