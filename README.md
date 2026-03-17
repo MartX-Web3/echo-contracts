@@ -44,7 +44,7 @@ User
  │              └─ Mode 0x02 (session):   validate against SessionPolicy
  │
  └─ EchoAccountFactory (on-chain)
-      └─ createAccount() → deploy + install module in one tx
+     └─ createAccount(InstanceRegistration r, bytes32 salt) → deploy + install module in one tx
 ```
 
 ### Request lifecycle
@@ -65,7 +65,7 @@ validateUserOp checks:
   9.  token daily cap not exceeded
   10. globalDailySpent + amountIn ≤ globalMaxPerDay
   11. globalTotalSpent + amountIn ≤ globalTotalBudget
-  12. block.timestamp > lastOpTimestamp + 1  (anti-replay)
+  12. block.timestamp > lastOpTimestamp      (anti-replay: reject same-second replays)
 ```
 
 **Session mode** (user absent, autonomous task):
@@ -84,7 +84,7 @@ validateUserOp checks:
   9.  recipient == AccountERC7579
   10. MetaPolicy global daily cap
   11. MetaPolicy globalTotalBudget
-  12. block.timestamp > lastOpTimestamp + 1
+  12. block.timestamp > lastOpTimestamp
 ```
 
 On `SIG_VALIDATION_SUCCESS`: `PolicyRegistry.recordSpend()` updates all spend counters atomically.
@@ -200,6 +200,15 @@ Echo operates on bounded trust, not complete trustlessness.
 
 - [Foundry](https://getfoundry.sh/)
 - Node.js 20+
+
+#### Foundry config (required)
+
+`foundry.toml` must enable `via_ir`:
+
+```toml
+[profile.default]
+via_ir = true
+```
 
 ### Install
 

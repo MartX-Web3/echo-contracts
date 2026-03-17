@@ -5,7 +5,6 @@ import "./interfaces/IPolicyRegistry.sol";
 import "./interfaces/IIntentRegistry.sol";
 
 /// @dev Minimal Ownable interface — OZ AccountERC7579 inherits Ownable.
-///      Used in onInstall to verify the smart account is owned by inst.owner.
 interface IOwnable {
     function owner() external view returns (address);
 }
@@ -25,59 +24,23 @@ struct PackedUserOperation {
 
 /// @title  EchoPolicyValidator
 /// @notice ERC-7579 type-1 validator module for Echo Protocol.
-///
-/// @dev    CALLDATA LAYOUT (problem 4 fix)
-///         userOp.callData is AccountERC7579.execute() — the outer call.
-///         IntentRegistry.decode() expects the inner swap calldata only.
-///         We must extract the inner calldata before passing to IntentRegistry.
-///
-///         AccountERC7579.execute(bytes32 mode, bytes calldata executionCalldata)
-///         ABI layout:
-///           [0:4]    selector of execute()
-///           [4:36]   mode (bytes32)
-///           [36:68]  ABI offset pointer to executionCalldata (always 0x40 = 64)
-///           [68:100] length of executionCalldata bytes
-///           [100:120] target address (20 bytes, packed — no padding in encodePacked)
-///           [120:152] value (uint256, 32 bytes)
-///           [152:...]  inner calldata (the actual swap calldata)
-///
-///         _extractTarget reads [100:120].
-///         _extractInnerCalldata reads [152:].
-///         Both operate on the outer userOp.callData.
-///
-///         ERC-7562 storage compliance:
-///           _accountInstance[msg.sender] — keyed by calling account, compliant.
-///           PolicyRegistry reads are view calls on storage derived from that key.
-///
-///         Signature encoding:
-///           Real-time: [0x01][executeKey (32b)]                  = 33 bytes
-///           Session:   [0x02][sessionId (32b)][sessionKey (32b)] = 65 bytes
 contract EchoPolicyValidator {
 
-    // ── Constants ──────────────────────────────────────────────────────────
-
-    uint8   private constant MODE_REALTIME = 0x01;
-    uint8   private constant MODE_SESSION  = 0x02;
+    uint8   private constant MODE_REALTIME   = 0x01;
+    uint8   private constant MODE_SESSION    = 0x02;
     uint256 private constant SECONDS_PER_DAY = 86400;
-    uint256 private constant SIG_SUCCESS   = 0;
-    uint256 private constant SIG_FAILED    = 1;
+    uint256 private constant SIG_SUCCESS     = 0;
+    uint256 private constant SIG_FAILED      = 1;
 
-    // Outer calldata offsets (all positions in userOp.callData bytes):
-    uint256 private constant OUTER_TARGET_START  = 100; // 20-byte address starts here
-    uint256 private constant OUTER_TARGET_END    = 120;
-    uint256 private constant OUTER_INNER_START   = 152; // inner swap calldata starts here
-    uint256 private constant OUTER_MIN_LEN       = 153; // at least 1 byte of inner data
-
-    // ── Immutables ─────────────────────────────────────────────────────────
+    uint256 private constant OUTER_TARGET_START = 100;
+    uint256 private constant OUTER_TARGET_END   = 120;
+    uint256 private constant OUTER_INNER_START  = 152;
 
     IPolicyRegistry public immutable registry;
     IIntentRegistry public immutable intentRegistry;
 
-    // ── Storage (ERC-7562: keyed by account address = msg.sender) ─────────
-
     mapping(address account => bytes32 instanceId) private _accountInstance;
-
-    // ── Events ─────────────────────────────────────────────────────────────
+    mapping(address account => uint256 lastOpTimestamp) private _lastOpTimestamp;
 
     event ValidationPassed(
         address indexed account,
@@ -87,14 +50,11 @@ contract EchoPolicyValidator {
         uint256 amountIn,
         bool    isExploration
     );
-
     event ValidationFailed(
         address indexed account,
         bytes32 indexed instanceId,
         string  reason
     );
-
-    // ── Constructor ────────────────────────────────────────────────────────
 
     constructor(address _registry, address _intentRegistry) {
         require(_registry       != address(0), "Zero registry");
@@ -110,24 +70,6 @@ contract EchoPolicyValidator {
         bytes32 instanceId = abi.decode(data, (bytes32));
         require(instanceId != bytes32(0), "onInstall: zero instanceId");
 
-        // SECURITY (CRITICAL-1): the smart account calling onInstall must be
-        // owned (via Ownable.owner()) by the same address that owns the
-        // PolicyInstance (inst.owner = user EOA wallet).
-        //
-        // Why not check msg.sender == inst.owner directly?
-        //   inst.owner = user EOA wallet
-        //   msg.sender = smart account address (different)
-        //   Direct check would always fail.
-        //
-        // Why not skip the check?
-        //   Without it, an attacker can bind their account to victim's instanceId
-        //   and exhaust the victim's daily/total budget counters (DoS).
-        //   No token theft occurs (tokens stay in victim's account), but the
-        //   victim's policy becomes unusable.
-        //
-        // The correct check: the smart account's owner (OZ Ownable) must match
-        //   the PolicyInstance owner. Attacker's account has owner = attacker,
-        //   which will not match inst.owner = victim EOA. Attack blocked.
         IPolicyRegistry.PolicyInstance memory inst = registry.getInstance(instanceId);
         address accountOwner = IOwnable(msg.sender).owner();
         require(accountOwner == inst.owner, "onInstall: account owner mismatch");
@@ -137,6 +79,7 @@ contract EchoPolicyValidator {
 
     function onUninstall(bytes calldata) external {
         delete _accountInstance[msg.sender];
+        delete _lastOpTimestamp[msg.sender];
     }
 
     function isModuleType(uint256 moduleTypeId) external pure returns (bool) {
@@ -162,7 +105,6 @@ contract EchoPolicyValidator {
         }
 
         bytes calldata sig = userOp.signature;
-
         if (sig.length < 33) {
             emit ValidationFailed(account, instanceId, "Signature too short");
             return SIG_FAILED;
@@ -185,7 +127,7 @@ contract EchoPolicyValidator {
         return SIG_FAILED;
     }
 
-    // ── Real-time mode: 12 checks ──────────────────────────────────────────
+    // ── Real-time: 12 checks ───────────────────────────────────────────────
 
     function _validateRealtime(
         address account,
@@ -215,15 +157,13 @@ contract EchoPolicyValidator {
             return SIG_FAILED;
         }
 
-        // Check 4 — Anti-replay
-        if (block.timestamp <= instV.lastOpTimestamp) {
+        // Check 4 — Anti-replay (strictly monotone: each op must be in a later second)
+        if (block.timestamp <= _lastOpTimestamp[account]) {
             emit ValidationFailed(account, instanceId, "Anti-replay: too fast");
             return SIG_FAILED;
         }
 
-        bytes calldata innerData = _extractInnerCalldata(userOp.callData);
-
-        // Check 5 & 6 — Extract target and validate allowedTargets
+        // Check 5 & 6 — target in allowedTargets
         {
             address target = _extractTarget(userOp.callData);
             if (target == address(0)) {
@@ -236,7 +176,9 @@ contract EchoPolicyValidator {
             }
         }
 
-        // Check 7 — Selector in allowedSelectors
+        bytes calldata innerData = _extractInnerCalldata(userOp.callData);
+
+        // Check 7 — selector in allowedSelectors
         if (innerData.length < 4) {
             emit ValidationFailed(account, instanceId, "Inner calldata too short");
             return SIG_FAILED;
@@ -246,22 +188,21 @@ contract EchoPolicyValidator {
             return SIG_FAILED;
         }
 
-        // Decode inner calldata via IntentRegistry
-        (address tokenOut, uint256 amountIn, address recipient) = _decodeRealtime(innerData);
+        (, address tokenOut, uint256 amountIn, address recipient) = _safeDecode(innerData);
         if (tokenOut == address(0)) {
             emit ValidationFailed(account, instanceId, "Calldata decode failed");
             return SIG_FAILED;
         }
 
-        // Check 8 — Recipient must be this account (S2)
+        // Check 8 — recipient == account (S2)
         if (recipient != account) {
             emit ValidationFailed(account, instanceId, "Recipient not account");
             return SIG_FAILED;
         }
 
-        // Check 9 & 10 — Token limits or exploration
-        IPolicyRegistry.TokenLimitValidation memory tlV = registry.getTokenLimitValidation(instanceId, tokenOut);
-
+        // Check 9 & 10 — token limits or exploration
+        IPolicyRegistry.TokenLimitValidation memory tlV =
+            registry.getTokenLimitValidation(instanceId, tokenOut);
         bool isExploration = (tlV.maxPerOp == 0);
 
         if (isExploration) {
@@ -290,7 +231,7 @@ contract EchoPolicyValidator {
             }
         }
 
-        // Check 11 — Global daily cap
+        // Check 11 — global daily cap
         uint256 effectiveGlobalDaily = (instV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
             ? instV.globalDailySpent : 0;
         if (effectiveGlobalDaily + amountIn > instV.globalMaxPerDay) {
@@ -298,29 +239,19 @@ contract EchoPolicyValidator {
             return SIG_FAILED;
         }
 
-        // Check 12 — Global total budget (S3)
+        // Check 12 — global total budget (S3)
         if (instV.globalTotalSpent + amountIn > instV.globalTotalBudget) {
             emit ValidationFailed(account, instanceId, "Global budget exhausted");
             return SIG_FAILED;
         }
 
         registry.recordSpend(instanceId, bytes32(0), tokenOut, amountIn, isExploration);
+        _lastOpTimestamp[account] = block.timestamp;
         emit ValidationPassed(account, instanceId, bytes32(0), tokenOut, amountIn, isExploration);
         return SIG_SUCCESS;
     }
 
-    /// @dev Decode inner calldata for real-time mode.
-    ///      Real-time validation only needs (tokenOut, amountIn, recipient).
-    function _decodeRealtime(bytes calldata innerData)
-        private
-        view
-        returns (address tokenOut, uint256 amountIn, address recipient)
-    {
-        (, address _tokenOut, uint256 _amountIn, address _recipient) = _safeDecode(innerData);
-        return (_tokenOut, _amountIn, _recipient);
-    }
-
-    // ── Session mode: 12 checks ────────────────────────────────────────────
+    // ── Session: 12 checks ─────────────────────────────────────────────────
 
     function _validateSession(
         address account,
@@ -334,39 +265,40 @@ contract EchoPolicyValidator {
         IPolicyRegistry.SessionValidation memory sessV =
             registry.getSessionValidation(sessionId);
 
-        // Check 1 — Session Key valid
+        // Check 1 — session key valid
         if (keccak256(abi.encode(rawSessKey)) != sessV.sessionKeyHash) {
             emit ValidationFailed(account, instanceId, "Session Key invalid");
             return SIG_FAILED;
         }
 
-        // Check 2 — Session belongs to this instance
+        // Check 2 — session belongs to this instance
         if (sessV.instanceId != instanceId) {
             emit ValidationFailed(account, instanceId, "Session instance mismatch");
             return SIG_FAILED;
         }
 
-        // Check 3 — Session active
+        // Check 3 — session active
         if (!sessV.active) {
             emit ValidationFailed(account, instanceId, "Session revoked");
             return SIG_FAILED;
         }
 
-        // Check 4 — Session not expired
+        // Check 4 — session not expired
         if (block.timestamp >= uint256(sessV.sessionExpiry)) {
             emit ValidationFailed(account, instanceId, "Session expired");
             return SIG_FAILED;
         }
 
+        // Checks 5–11: calldata, token match, recipient, session budget/ops
         (uint256 amountIn, bool ok) = _checkSessionCalldataAndLimits(
-            account,
-            instanceId,
-            userOp.callData,
-            sessV
+            account, instanceId, userOp.callData, sessV
         );
         if (!ok) return SIG_FAILED;
 
-        // Check 12 — MetaPolicy global caps (re-verified)
+        // Check 12 — MetaPolicy global caps + subset re-verification
+        // Re-verify that SessionPolicy ⊆ PolicyInstance at validation time.
+        // The instance may have changed since session creation (user lowered
+        // limits, reduced exploration budget, removed a token, etc.).
         IPolicyRegistry.InstanceValidation memory instV =
             registry.getInstanceValidation(instanceId);
 
@@ -378,7 +310,7 @@ contract EchoPolicyValidator {
             emit ValidationFailed(account, instanceId, "Instance expired");
             return SIG_FAILED;
         }
-        if (block.timestamp <= instV.lastOpTimestamp) {
+        if (block.timestamp <= _lastOpTimestamp[account]) {
             emit ValidationFailed(account, instanceId, "Anti-replay: too fast");
             return SIG_FAILED;
         }
@@ -394,24 +326,59 @@ contract EchoPolicyValidator {
             return SIG_FAILED;
         }
 
+        // Subset re-verification: token-level constraints at validation time.
+        // Even though session creation validated these, the instance may have changed.
         IPolicyRegistry.TokenLimitValidation memory tlV =
             registry.getTokenLimitValidation(instanceId, sessV.tokenOut);
         bool isExploration = (tlV.maxPerOp == 0);
 
+        if (isExploration) {
+            // tokenOut is still an exploration token — re-verify exploration budget
+            if (instV.explorationBudget == 0) {
+                emit ValidationFailed(account, instanceId, "Exploration budget removed from instance");
+                return SIG_FAILED;
+            }
+            if (amountIn > instV.explorationPerTx) {
+                emit ValidationFailed(account, instanceId, "Exceeds exploration per-tx (re-verify)");
+                return SIG_FAILED;
+            }
+            if (instV.explorationSpent + amountIn > instV.explorationBudget) {
+                emit ValidationFailed(account, instanceId, "Exploration budget exhausted (re-verify)");
+                return SIG_FAILED;
+            }
+        } else {
+            // tokenOut is a whitelisted token — re-verify token daily cap
+            if (tlV.maxPerOp == 0) {
+                // Token was removed from tokenLimits since session creation
+                emit ValidationFailed(account, instanceId, "Token removed from instance limits");
+                return SIG_FAILED;
+            }
+            if (amountIn > tlV.maxPerOp) {
+                emit ValidationFailed(account, instanceId, "Exceeds token per-op limit (re-verify)");
+                return SIG_FAILED;
+            }
+            uint256 effectiveTokenDaily = (tlV.lastOpDay == block.timestamp / SECONDS_PER_DAY)
+                ? tlV.dailySpent : 0;
+            if (effectiveTokenDaily + amountIn > tlV.maxPerDay) {
+                emit ValidationFailed(account, instanceId, "Exceeds token daily limit (re-verify)");
+                return SIG_FAILED;
+            }
+        }
+
         registry.recordSpend(instanceId, sessionId, sessV.tokenOut, amountIn, isExploration);
+        _lastOpTimestamp[account] = block.timestamp;
         emit ValidationPassed(account, instanceId, sessionId, sessV.tokenOut, amountIn, isExploration);
         return SIG_SUCCESS;
     }
 
-    /// @dev Session checks 5–11: target/selector checks + decode + session constraints.
-    ///      Emits ValidationFailed and returns (0,false) on failure.
+    /// @dev Session checks 5–11: target, selector, decode, token match, recipient, budget/ops.
     function _checkSessionCalldataAndLimits(
         address account,
         bytes32 instanceId,
         bytes calldata outerCallData,
         IPolicyRegistry.SessionValidation memory sessV
     ) private returns (uint256 amountIn, bool ok) {
-        // Extract target and enforce allowedTargets (CRITICAL-2)
+
         address target = _extractTarget(outerCallData);
         if (target == address(0)) {
             emit ValidationFailed(account, instanceId, "Cannot extract target");
@@ -473,32 +440,18 @@ contract EchoPolicyValidator {
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
-    /// @dev Extract the target contract address from AccountERC7579.execute() calldata.
-    ///      executionCalldata = abi.encodePacked(target, value, innerCalldata)
-    ///      target is packed at bytes [100:120] of the outer callData.
-    ///      Returns address(0) if callData is too short.
     function _extractTarget(bytes calldata data) private pure returns (address) {
         if (data.length < OUTER_TARGET_END) return address(0);
         return address(bytes20(data[OUTER_TARGET_START:OUTER_TARGET_END]));
     }
 
-    /// @dev Extract the inner swap calldata from AccountERC7579.execute() calldata.
-    ///      Inner calldata starts at byte 152 (after selector + mode + offset + length
-    ///      + target + value).
-    ///      Returns empty bytes slice if callData is too short.
     function _extractInnerCalldata(bytes calldata data)
-        private pure returns (bytes calldata inner)
+        private pure returns (bytes calldata)
     {
-        if (data.length <= OUTER_INNER_START) {
-            // Return empty calldata slice
-            return data[0:0];
-        }
+        if (data.length <= OUTER_INNER_START) return data[0:0];
         return data[OUTER_INNER_START:];
     }
 
-    /// @dev Safe wrapper around IntentRegistry.decode().
-    ///      Returns zero values instead of reverting so validateUserOp
-    ///      can return SIG_FAILED cleanly without reverting.
     function _safeDecode(bytes calldata data) private view returns (
         address tokenIn,
         address tokenOut,
@@ -514,7 +467,6 @@ contract EchoPolicyValidator {
         }
     }
 
-    /// @notice Returns the instanceId associated with an account.
     function getAccountInstance(address account) external view returns (bytes32) {
         return _accountInstance[account];
     }

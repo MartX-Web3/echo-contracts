@@ -300,7 +300,12 @@ contract EchoPolicyValidatorTest is Test {
     function test_RT_check10_exceedsTokenDaily_fails() public {
         bytes memory cd = _validCD(USDC, WETH, 100e6);
         PackedUserOperation memory op = _op(cd, _rtSig(rawExecKey));
-        for (uint i = 0; i < 5; i++) { _pass(account.validate(op), "op"); vm.warp(block.timestamp+1); }
+        uint256 t = block.timestamp;
+        for (uint i = 0; i < 5; i++) {
+            _pass(account.validate(op), "op");
+            t += 1;
+            vm.warp(t);
+        }
         _fail(account.validate(op), "RT10 token daily");
     }
 
@@ -314,11 +319,20 @@ contract EchoPolicyValidatorTest is Test {
         // Max out WETH (5 ops × 100)
         bytes memory cdW = _validCD(USDC, WETH, 100e6);
         PackedUserOperation memory opW = _op(cdW, _rtSig(rawExecKey));
-        for (uint i = 0; i < 5; i++) { _pass(account.validate(opW), "weth"); vm.warp(block.timestamp+1); }
+        uint256 t = block.timestamp;
+        for (uint i = 0; i < 5; i++) {
+            _pass(account.validate(opW), "weth");
+            t += 1;
+            vm.warp(t);
+        }
         // Spend WBTC (5 ops × 100 = 500, global now 1000)
         bytes memory cdB = _validCD(USDC, WBTC, 100e6);
         PackedUserOperation memory opB = _op(cdB, _rtSig(rawExecKey));
-        for (uint i = 0; i < 5; i++) { _pass(account.validate(opB), "wbtc"); vm.warp(block.timestamp+1); }
+        for (uint i = 0; i < 5; i++) {
+            _pass(account.validate(opB), "wbtc");
+            t += 1;
+            vm.warp(t);
+        }
         _fail(account.validate(opB), "RT11 global daily");
     }
 
@@ -327,12 +341,15 @@ contract EchoPolicyValidatorTest is Test {
         bytes memory cd = _validCD(USDC, WETH, 100e6);
         PackedUserOperation memory op = _op(cd, _rtSig(rawExecKey));
         uint256 spent = 0;
+        uint256 t = block.timestamp;
         for (uint day = 0; day < 60 && spent < 5000e6; day++) {
             for (uint i = 0; i < 5 && spent < 5000e6; i++) {
                 if (account.validate(op) == 0) spent += 100e6;
-                vm.warp(block.timestamp + 1);
+                t += 1;
+                vm.warp(t);
             }
-            vm.warp(block.timestamp + DAY);
+            t += DAY;
+            vm.warp(t);
         }
         _fail(account.validate(op), "RT12 global budget");
     }
@@ -353,7 +370,12 @@ contract EchoPolicyValidatorTest is Test {
     function test_RT_exploration_budgetExhausted_fails() public {
         bytes memory cd = _validCD(USDC, TRUMP, 10e6);
         PackedUserOperation memory op = _op(cd, _rtSig(rawExecKey));
-        for (uint i = 0; i < 5; i++) { _pass(account.validate(op), "expl"); vm.warp(block.timestamp+1); }
+        uint256 t = block.timestamp;
+        for (uint i = 0; i < 5; i++) {
+            _pass(account.validate(op), "expl");
+            t += 1;
+            vm.warp(t);
+        }
         _fail(account.validate(op), "exploration exhausted");
     }
 
@@ -362,10 +384,12 @@ contract EchoPolicyValidatorTest is Test {
     // S2: recipient always account, never third party
     function test_S2_attackerRecipient_fails() public {
         address[3] memory bad = [makeAddr("a"), address(0xdead), address(registry)];
+        uint256 t = block.timestamp;
         for (uint i = 0; i < 3; i++) {
             bytes memory cd = _executeCD(UNI_ROUTER, USDC, WETH, 50e6, bad[i]);
             _fail(account.validate(_op(cd, _rtSig(rawExecKey))), "S2");
-            vm.warp(block.timestamp + 1);
+            t += 1;
+            vm.warp(t);
         }
     }
 
@@ -455,12 +479,15 @@ contract EchoPolicyValidatorTest is Test {
         bytes memory cd = _validCD(USDC, WETH, 50e6);
         PackedUserOperation memory op = _op(cd, _sessSig(sid, rawSessKey));
         uint256 spent = 0;
+        uint256 t = block.timestamp;
         for (uint day = 0; day < 10 && spent < 350e6; day++) {
             for (uint i = 0; i < 2 && spent < 350e6; i++) {
                 if (account.validate(op) == 0) spent += 50e6;
-                vm.warp(block.timestamp + 1);
+                t += 1;
+                vm.warp(t);
             }
-            vm.warp(block.timestamp + DAY);
+            t += DAY;
+            vm.warp(t);
         }
         _fail(account.validate(op), "sess10 budget");
     }
@@ -469,10 +496,11 @@ contract EchoPolicyValidatorTest is Test {
         bytes32 sid = _createSess(); // maxOpsPerDay = 2
         bytes memory cd = _validCD(USDC, WETH, 50e6);
         PackedUserOperation memory op = _op(cd, _sessSig(sid, rawSessKey));
-        _pass(account.validate(op), "op1"); vm.warp(block.timestamp+1);
-        _pass(account.validate(op), "op2"); vm.warp(block.timestamp+1);
+        uint256 t = block.timestamp;
+        _pass(account.validate(op), "op1"); t += 1; vm.warp(t);
+        _pass(account.validate(op), "op2"); t += 1; vm.warp(t);
         _fail(account.validate(op), "sess11 daily ops");
-        vm.warp(block.timestamp + DAY);
+        t += DAY; vm.warp(t);
         _pass(account.validate(op), "resets next day");
     }
 
@@ -487,9 +515,15 @@ contract EchoPolicyValidatorTest is Test {
     function test_dailyReset_tokenLimit() public {
         bytes memory cd = _validCD(USDC, WETH, 100e6);
         PackedUserOperation memory op = _op(cd, _rtSig(rawExecKey));
-        for (uint i = 0; i < 5; i++) { _pass(account.validate(op), "hit 500"); vm.warp(block.timestamp+1); }
+        uint256 t = block.timestamp;
+        for (uint i = 0; i < 5; i++) {
+            _pass(account.validate(op), "hit 500");
+            t += 1;
+            vm.warp(t);
+        }
         _fail(account.validate(op), "limit hit");
-        vm.warp(block.timestamp + DAY);
+        t += DAY;
+        vm.warp(t);
         _pass(account.validate(op), "resets");
     }
 
