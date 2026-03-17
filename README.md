@@ -17,7 +17,8 @@ Echo Protocol allows users to grant AI agents bounded on-chain operation authori
 | `PolicyRegistry` | Stores PolicyTemplates, PolicyInstances, SessionPolicies, and Execute Key hashes. The source of truth for all permission state. |
 | `IntentRegistry` | Immutable calldata decoder. Maps Uniswap V3 function selectors to semantic parameter positions (tokenIn, tokenOut, amountIn, recipient). |
 | `EchoPolicyValidator` | ERC-7579 type-1 validator module. Validates every UserOperation against MetaPolicy or SessionPolicy before execution. The final on-chain enforcer. |
-| `EchoAccountFactory` | Deploys an OpenZeppelin AccountERC7579 and installs EchoPolicyValidator as a module in a single transaction. |
+| `EchoAccount` | Concrete OZ AccountERC7579 subclass. Adds `initialize(userWallet, validator, instanceId)` for clone deployment. Deployed once as implementation; each user gets an EIP-1167 clone. |
+| `EchoAccountFactory` | Deploys an EchoAccount clone and registers a PolicyInstance in a single transaction. |
 
 ---
 
@@ -29,7 +30,7 @@ User
  ├─ PolicyRegistry (on-chain)
  │    ├─ PolicyTemplate      reusable parameter sets, created by Echo team
  │    ├─ PolicyInstance      per-user policy, references a template + overrides
- │    │    ├─ tokenLimits    per-token maxPerOp + maxPerDay
+ │    │    ├─ tokenLimits    per-token maxPerOp + maxPerDay (stored in separate mapping)
  │    │    ├─ explorationBudget  capped allowance for unlisted tokens
  │    │    └─ globalCaps     daily and lifetime total limits
  │    └─ SessionPolicy       task-scoped sub-policy for autonomous execution
@@ -37,14 +38,15 @@ User
  ├─ IntentRegistry (on-chain, immutable)
  │    └─ decode(calldata) → (tokenIn, tokenOut, amountIn, recipient)
  │
- ├─ AccountERC7579 (on-chain, per user)
+ ├─ EchoAccount / AccountERC7579 (on-chain, per user — EIP-1167 clone)
  │    └─ EchoPolicyValidator installed as ERC-7579 module
  │         └─ validateUserOp()
  │              ├─ Mode 0x01 (real-time): validate against PolicyInstance
  │              └─ Mode 0x02 (session):   validate against SessionPolicy
  │
  └─ EchoAccountFactory (on-chain)
-     └─ createAccount(InstanceRegistration r, bytes32 salt) → deploy + install module in one tx
+      └─ createAccount(InstanceRegistration r, bytes32 salt)
+           → register PolicyInstance + deploy EchoAccount clone + initialize in one tx
 ```
 
 ### Request lifecycle
@@ -53,38 +55,40 @@ User
 ```
 UserOperation.signature = [0x01][pad(executeKey, 32)]
 
-validateUserOp checks:
+validateUserOp checks (in execution order):
   1.  executeKey hash valid and not revoked
   2.  instance not paused
   3.  block.timestamp < instance.expiry
-  4.  IntentRegistry.decode(callData) → tokenIn, tokenOut, amountIn, recipient
+  4.  block.timestamp > lastOpTimestamp      (anti-replay: reject same-second replays)
   5.  target in allowedTargets
   6.  selector in allowedSelectors
-  7.  recipient == AccountERC7579
-  8.  amountIn ≤ tokenLimits[tokenOut].maxPerOp  OR  ≤ explorationPerTx
-  9.  token daily cap not exceeded
-  10. globalDailySpent + amountIn ≤ globalMaxPerDay
-  11. globalTotalSpent + amountIn ≤ globalTotalBudget
-  12. block.timestamp > lastOpTimestamp      (anti-replay: reject same-second replays)
+  7.  IntentRegistry.decode(innerCalldata) → tokenIn, tokenOut, amountIn, recipient
+  8.  recipient == account (the smart account)
+  9.  amountIn ≤ tokenLimits[tokenOut].maxPerOp  OR  ≤ explorationPerTx
+  10. token daily cap not exceeded
+  11. globalDailySpent + amountIn ≤ globalMaxPerDay
+  12. globalTotalSpent + amountIn ≤ globalTotalBudget
 ```
 
 **Session mode** (user absent, autonomous task):
 ```
 UserOperation.signature = [0x02][sessionId (32b)][pad(sessionKey, 32b)]
 
-validateUserOp checks:
+validateUserOp checks (in execution order):
   1.  sessionKey hash valid
-  2.  session.active == true
-  3.  block.timestamp < session.sessionExpiry
-  4.  SessionPolicy ⊆ PolicyInstance  (re-verified at validation time)
-  5.  tokenIn matches session
-  6.  tokenOut matches session
-  7.  amountIn ≤ session.maxAmountPerOp
-  8.  session.totalSpent + amountIn ≤ session.totalBudget
-  9.  recipient == AccountERC7579
-  10. MetaPolicy global daily cap
-  11. MetaPolicy globalTotalBudget
-  12. block.timestamp > lastOpTimestamp
+  2.  session belongs to this account's instance
+  3.  session.active == true
+  4.  block.timestamp < session.sessionExpiry
+  5.  target in allowedTargets
+  6.  selector in allowedSelectors
+  7.  tokenIn matches session
+  8.  tokenOut matches session
+  9.  recipient == account (the smart account)
+  10. amountIn ≤ session.maxAmountPerOp
+  11. session.totalSpent + amountIn ≤ session.totalBudget
+  12. session daily ops limit not exceeded
+  13. MetaPolicy: not paused, not expired, anti-replay, global daily cap, global total budget
+  14. SessionPolicy ⊆ PolicyInstance re-verified at validation time (token-level subset check)
 ```
 
 On `SIG_VALIDATION_SUCCESS`: `PolicyRegistry.recordSpend()` updates all spend counters atomically.
@@ -105,27 +109,28 @@ Reusable parameter sets created by the Echo team. Three official templates ship 
 
 ### PolicyInstance
 
-Per-user policy that references a template and overrides specific fields. Key fields:
+Per-user policy that references a template and overrides specific fields.
 
 ```solidity
 struct PolicyInstance {
     bytes32   templateId;
     address   owner;
-    bytes32   executeKeyHash;       // keccak256 of raw key — never the raw key
-    address[] allowedTargets;       // whitelisted protocol contracts
-    bytes4[]  allowedSelectors;     // whitelisted function selectors
-    // per-token limits
-    mapping(address => TokenLimit) tokenLimits;
-    // exploration budget for unlisted tokens
-    uint256 explorationBudget;
-    uint256 explorationPerTx;
-    uint256 explorationSpent;
-    // global caps
-    uint256 globalMaxPerDay;
-    uint256 globalTotalBudget;
-    uint256 globalTotalSpent;       // append-only
-    uint64  expiry;
-    bool    paused;
+    bytes32   executeKeyHash;    // keccak256 of raw key — never the raw key
+    address[] allowedTargets;    // whitelisted protocol contracts
+    bytes4[]  allowedSelectors;  // whitelisted function selectors
+    address[] tokenList;         // enumeration of tokens with limits
+    // per-token limits stored in: mapping(bytes32 instanceId => mapping(address token => TokenLimit))
+    uint256   explorationBudget; // capped allowance for unlisted tokens
+    uint256   explorationPerTx;
+    uint256   explorationSpent;
+    uint256   globalMaxPerDay;
+    uint256   globalTotalBudget;
+    uint256   globalTotalSpent;  // append-only
+    uint256   globalDailySpent;
+    uint256   lastOpDay;
+    uint256   lastOpTimestamp;
+    uint64    expiry;
+    bool      paused;
 }
 ```
 
@@ -135,16 +140,18 @@ Task-scoped sub-policy for autonomous recurring strategies. Always a strict subs
 
 ```solidity
 struct SessionPolicy {
-    bytes32 instanceId;
-    bytes32 sessionKeyHash;
-    address tokenIn;
-    address tokenOut;
-    uint256 maxAmountPerOp;
-    uint256 totalBudget;
-    uint256 totalSpent;             // append-only
-    uint256 maxOpsPerDay;
-    uint64  sessionExpiry;
-    bool    active;
+    bytes32  instanceId;
+    bytes32  sessionKeyHash;
+    address  tokenIn;
+    address  tokenOut;
+    uint256  maxAmountPerOp;
+    uint256  totalBudget;
+    uint256  totalSpent;      // append-only
+    uint256  maxOpsPerDay;
+    uint256  dailyOps;
+    uint256  lastOpDay;
+    uint64   sessionExpiry;
+    bool     active;
 }
 ```
 
@@ -190,6 +197,7 @@ Echo operates on bounded trust, not complete trustlessness.
 | PolicyRegistry | `TBD` |
 | IntentRegistry | `TBD` |
 | EchoPolicyValidator | `TBD` |
+| EchoAccount (impl) | `TBD` |
 | EchoAccountFactory | `TBD` |
 
 ---
@@ -203,7 +211,7 @@ Echo operates on bounded trust, not complete trustlessness.
 
 #### Foundry config (required)
 
-`foundry.toml` must enable `via_ir`:
+`foundry.toml` must enable `via_ir` due to OZ v5 contract complexity:
 
 ```toml
 [profile.default]
@@ -213,7 +221,7 @@ via_ir = true
 ### Install
 
 ```bash
-git clone https://github.com/echo-protocol/echo-contracts
+git clone https://github.com/echo-protocol-lab/echo-contracts
 cd echo-contracts
 forge install
 ```
@@ -227,7 +235,7 @@ forge build
 ### Test
 
 ```bash
-# Unit tests
+# All tests
 forge test -vvv
 
 # With Sepolia fork (requires SEPOLIA_RPC_URL in .env)
@@ -261,10 +269,10 @@ ETHERSCAN_API_KEY=...
 
 ## External dependencies
 
-| Dependency | Version | Purpose |
-|---|---|---|
-| OpenZeppelin Contracts | v5.2 | AccountERC7579, ERC7579ValidatorBase |
-| forge-std | latest | Test utilities |
+| Dependency | Purpose |
+|---|---|
+| OpenZeppelin Contracts v5 | AccountERC7579, Ownable, Initializable, SignerECDSA |
+| forge-std | Test utilities |
 
 ---
 
@@ -272,7 +280,7 @@ ETHERSCAN_API_KEY=...
 
 Internal security review by Dr. Jeff Ma (CTO). Formal third-party audit required before mainnet deployment.
 
-**Checklist items:** ERC-7562 storage compliance, reentrancy, integer overflow, S1–S4 invariants, EIP-712 domain separation, bounded approvals, IntentRegistry fuzz testing.
+**Checklist items:** ERC-7562 storage compliance, reentrancy analysis, integer overflow (Solidity 0.8.24 checked arithmetic), S1–S4 invariants, bounded approvals, IntentRegistry fuzz testing, onInstall ownership enforcement, session subset re-verification.
 
 ---
 
