@@ -66,7 +66,7 @@ interface IPolicyRegistry {
 
     /// @notice Bundle of parameters for registering a PolicyInstance.
     /// @dev    Exists to avoid "stack too deep" in callers that need to forward
-    ///         many dynamic arrays (e.g. EchoAccountFactory).
+    ///         many dynamic arrays (e.g. EchoOnboarding).
     struct InstanceRegistration {
         address   owner;
         bytes32   templateId;
@@ -169,10 +169,24 @@ interface IPolicyRegistry {
     ) external returns (bytes32 instanceId);
 
     /// @notice Register an instance on behalf of `InstanceRegistration.owner`.
-    /// @dev    Only callable by EchoAccountFactory (onlyFactory).
+    /// @dev    Only callable by the trusted `factory` address (onlyFactory).
     function registerInstanceForStruct(
         InstanceRegistration calldata r
     ) external returns (bytes32 instanceId);
+
+    /// @notice Echo team admin (immutable in implementation).
+    function owner() external view returns (address);
+
+    /// @notice Trusted EIP-7702 onboarding helper. Set once via `setOnboarding`.
+    function onboarding() external view returns (address);
+
+    function setOnboarding(address _onboarding) external;
+
+    /// @notice Register instance with `PolicyInstance.owner = r.owner`. Only `onboarding` may call.
+    /// @dev    `EchoOnboarding` checks `r.owner == msg.sender` before forwarding here.
+    function registerInstanceStructAsOnboarding(InstanceRegistration calldata r)
+        external
+        returns (bytes32 instanceId);
 
     function setTokenLimit(bytes32 instanceId, address token, uint256 maxPerOp, uint256 maxPerDay) external;
     function removeTokenLimit(bytes32 instanceId, address token) external;

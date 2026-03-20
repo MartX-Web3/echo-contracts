@@ -557,6 +557,56 @@ contract PolicyRegistryTest is Test {
         reg2.setFactory(makeAddr("f2"));
     }
 
+    // ── setOnboarding ─────────────────────────────────────────────────────
+
+    function test_setOnboarding_success() public {
+        PolicyRegistry reg2 = new PolicyRegistry(echoOwner);
+        address ob = makeAddr("onboarding");
+        vm.prank(echoOwner);
+        reg2.setOnboarding(ob);
+        assertEq(reg2.onboarding(), ob);
+    }
+
+    function test_setOnboarding_nonOwner_reverts() public {
+        PolicyRegistry reg2 = new PolicyRegistry(echoOwner);
+        vm.prank(makeAddr("x"));
+        vm.expectRevert("Not owner");
+        reg2.setOnboarding(makeAddr("ob"));
+    }
+
+    function test_setOnboarding_twice_reverts() public {
+        PolicyRegistry reg2 = new PolicyRegistry(echoOwner);
+        vm.prank(echoOwner);
+        reg2.setOnboarding(makeAddr("a"));
+        vm.prank(echoOwner);
+        vm.expectRevert("Already set");
+        reg2.setOnboarding(makeAddr("b"));
+    }
+
+    function test_registerInstanceAsOnboarding_nonOnboarding_reverts() public {
+        address[] memory t; uint256[] memory p; uint256[] memory d;
+        address[] memory tgt; bytes4[] memory sel;
+        vm.prank(makeAddr("notOb"));
+        vm.expectRevert("Not onboarding");
+        registry.registerInstanceStructAsOnboarding(
+            IPolicyRegistry.InstanceRegistration({
+                owner:             user,
+                templateId:         templateId,
+                executeKeyHash:     keccak256("k"),
+                initialTokens:      t,
+                maxPerOps:          p,
+                maxPerDays:         d,
+                targets:            tgt,
+                selectors:          sel,
+                explorationBudget:  0,
+                explorationPerTx:   0,
+                globalMaxPerDay:    1000e6,
+                globalTotalBudget:  5000e6,
+                expiry:             uint64(block.timestamp + DAY)
+            })
+        );
+    }
+
     // ── registerInstanceFor ────────────────────────────────────────────────
 
     function test_registerInstanceFor_ownerIsUser() public {

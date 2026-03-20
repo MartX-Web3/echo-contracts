@@ -5,7 +5,6 @@ import "forge-std/Test.sol";
 import "../src/PolicyRegistry.sol";
 import "../src/IntentRegistry.sol";
 import "../src/EchoPolicyValidator.sol";
-import "../src/EchoAccountFactory.sol";
 import "../src/interfaces/IPolicyRegistry.sol";
 
 /// @dev Minimal ERC-20 interface for balance checks.
@@ -27,7 +26,7 @@ interface IAccount {
 ///           forge test --fork-url $SEPOLIA_RPC_URL --match-contract Integration
 ///
 ///         They verify the full end-to-end flow:
-///           Factory deploy → Policy register → Module install → Swap validate
+///           Policy register → Module install (mock SA) → Swap validate
 ///
 /// @dev    Since we cannot use the real OZ AccountERC7579 in the unit test
 ///         environment (requires forge install), Integration tests use a

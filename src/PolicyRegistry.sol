@@ -10,14 +10,16 @@ import "./interfaces/IPolicyRegistry.sol";
 /// @dev    Two privileged addresses beyond per-instance owners:
 ///         - `owner`   (Echo team): create templates, set factory/validator once
 ///         - `validator` (EchoPolicyValidator): call recordSpend after validation
-///         - `factory`   (EchoAccountFactory):  call registerInstanceFor
+///         - `factory`    optional trusted caller for `registerInstanceForStruct`
+///         - `onboarding` optional trusted caller for `registerInstanceStructAsOnboarding` (EIP-7702)
 contract PolicyRegistry is IPolicyRegistry {
 
     // ── Privileged addresses ───────────────────────────────────────────────
 
     address public immutable owner;
     address public validator;   // set once
-    address public factory;     // set once
+    address public factory;     // set once (optional)
+    address public onboarding;  // set once (optional)
 
     // ── Storage ────────────────────────────────────────────────────────────
 
@@ -57,6 +59,13 @@ contract PolicyRegistry is IPolicyRegistry {
         factory = _factory;
     }
 
+    function setOnboarding(address _onboarding) external {
+        require(msg.sender == owner,      "Not owner");
+        require(onboarding == address(0), "Already set");
+        require(_onboarding != address(0), "Zero address");
+        onboarding = _onboarding;
+    }
+
     // ── Modifiers ──────────────────────────────────────────────────────────
 
     modifier onlyOwner() {
@@ -77,6 +86,11 @@ contract PolicyRegistry is IPolicyRegistry {
 
     modifier onlyFactory() {
         require(msg.sender == factory, "Not factory");
+        _;
+    }
+
+    modifier onlyOnboarding() {
+        require(msg.sender == onboarding, "Not onboarding");
         _;
     }
 
@@ -135,6 +149,16 @@ contract PolicyRegistry is IPolicyRegistry {
     function registerInstanceForStruct(InstanceRegistration calldata r)
         external
         onlyFactory
+        returns (bytes32 instanceId)
+    {
+        require(r.owner != address(0), "Zero owner");
+        return _registerInstanceStruct(r, r.owner);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function registerInstanceStructAsOnboarding(InstanceRegistration calldata r)
+        external
+        onlyOnboarding
         returns (bytes32 instanceId)
     {
         require(r.owner != address(0), "Zero owner");

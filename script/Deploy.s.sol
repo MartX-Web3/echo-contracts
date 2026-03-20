@@ -5,20 +5,23 @@ import "forge-std/Script.sol";
 import "../src/PolicyRegistry.sol";
 import "../src/IntentRegistry.sol";
 import "../src/EchoPolicyValidator.sol";
-import "../src/EchoAccount.sol";
-import "../src/EchoAccountFactory.sol";
+import "../src/modules/EchoDelegationModule.sol";
+import "../src/EchoOnboarding.sol";
 
-/// @notice Deploy all Echo Protocol contracts to Sepolia.
+/// @notice Deploy Echo Protocol (EIP-7702 + ERC-4337 path) to Sepolia.
 ///
 ///         Deployment order:
-///           PolicyRegistry         ← no deps
-///           IntentRegistry         ← no deps
-///           EchoPolicyValidator    ← needs registry + intentRegistry
-///           EchoAccount (impl)     ← logic contract only, never initialized directly
-///           EchoAccountFactory     ← needs registry + validator + implementation
+///           PolicyRegistry
+///           IntentRegistry
+///           EchoPolicyValidator
+///           EchoDelegationModule   ← users' EIP-7702 delegation target
+///           EchoOnboarding         ← one-tx: register instance + bind EOA for 7702
 ///           registry.setValidator()
-///           registry.setFactory()
+///           registry.setOnboarding(onboarding)
+///           validator.setEip7702Onboarding(onboarding)
 ///           registry.createTemplate() × 3
+///
+///         No smart-account clone / factory: `UserOperation.sender` is the user EOA.
 ///
 ///         Required .env:
 ///           DEPLOYER_PRIVATE_KEY
@@ -45,39 +48,29 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerKey);
 
-        // 1. PolicyRegistry
         PolicyRegistry registry = new PolicyRegistry(deployer);
         console.log("PolicyRegistry:      ", address(registry));
 
-        // 2. IntentRegistry
         IntentRegistry intentReg = new IntentRegistry();
         console.log("IntentRegistry:      ", address(intentReg));
 
-        // 3. EchoPolicyValidator
         EchoPolicyValidator validator = new EchoPolicyValidator(
             address(registry),
             address(intentReg)
         );
         console.log("EchoPolicyValidator: ", address(validator));
 
-        // 4. EchoAccount implementation (logic only — _disableInitializers in constructor)
-        EchoAccount accountImpl = new EchoAccount();
-        console.log("EchoAccount impl:    ", address(accountImpl));
+        EchoDelegationModule delegation = new EchoDelegationModule(validator);
+        console.log("EchoDelegationModule:", address(delegation));
 
-        // 5. EchoAccountFactory
-        EchoAccountFactory factory = new EchoAccountFactory(
-            address(registry),
-            address(validator),
-            address(accountImpl)
-        );
-        console.log("EchoAccountFactory:  ", address(factory));
+        EchoOnboarding onboarding = new EchoOnboarding(registry, validator);
+        console.log("EchoOnboarding:      ", address(onboarding));
 
-        // 6. Wire up
         registry.setValidator(address(validator));
-        registry.setFactory(address(factory));
-        console.log("setValidator + setFactory: done");
+        registry.setOnboarding(address(onboarding));
+        validator.setEip7702Onboarding(address(onboarding));
+        console.log("setValidator + setOnboarding + setEip7702Onboarding: done");
 
-        // 7. Official templates
         bytes32 conservativeId = registry.createTemplate(
             "Conservative",
             50e6, 200e6, 20e6, 5e6, 400e6, 2000e6, uint64(90 * DAY)
@@ -93,14 +86,15 @@ contract Deploy is Script {
 
         vm.stopBroadcast();
 
-        // Summary
         console.log("");
-        console.log("=== DEPLOYMENT COMPLETE ===");
+        console.log("=== DEPLOYMENT COMPLETE (EIP-7702 path) ===");
         console.log("PolicyRegistry:      ", address(registry));
         console.log("IntentRegistry:      ", address(intentReg));
         console.log("EchoPolicyValidator: ", address(validator));
-        console.log("EchoAccount impl:    ", address(accountImpl));
-        console.log("EchoAccountFactory:  ", address(factory));
+        console.log("EchoDelegationModule:", address(delegation));
+        console.log("EchoOnboarding:      ", address(onboarding));
+        console.log("");
+        console.log("Configure gateway: DELEGATION_MODULE = delegation address above.");
         console.log("");
         console.log("Templates:");
         console.log("  Conservative:"); console.logBytes32(conservativeId);

@@ -202,6 +202,11 @@ contract EchoPolicyValidatorTest is Test {
         _fail(account.validate(_op(_validCD(USDC, WETH, 50e6), sig)), "unknown mode");
     }
 
+    function test_eip7702_mode_rejected_on_module_validateUserOp() public {
+        bytes memory sig = abi.encodePacked(uint8(0x03), rawExecKey);
+        _fail(account.validate(_op(_validCD(USDC, WETH, 50e6), sig)), "eip7702 on SA");
+    }
+
     // ── Real-time: happy path ──────────────────────────────────────────────
 
     function test_RT_valid_pass() public {

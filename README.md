@@ -8,17 +8,36 @@ Smart contracts for Echo Protocol — the on-chain permission layer for AI agent
 
 ## Overview
 
-Echo Protocol allows users to grant AI agents bounded on-chain operation authority. Every operation an agent attempts is validated on-chain against a user-signed policy before execution. The agent never touches the user's private key. No operation outside the policy can execute, regardless of whether the agent, tool, or framework is compromised.
+Echo Protocol allows users to grant AI agents bounded on-chain operation authority. Every operation an agent attempts is validated on-chain against policy (and optional session limits) before execution. The **default product path** is **EIP-7702**: the ERC-4337 `sender` is the user’s **EOA**, so DeFi calls see `msg.sender` as that EOA — **no per-user smart-account clone** and **no requirement to pre-fund a separate account contract with swap tokens**.
+
+### Design goals (default EIP-7702 path)
+
+| Goal | How it is met |
+|------|----------------|
+| **No pre-funding a “SA” for swap principal** | Tokens and router approvals stay on the **EOA**; `EchoDelegationModule` runs as delegated code **at the EOA address**. |
+| **EOA master key not given to AI** | User signs **EIP-7702 authorization** (and policy txs) in the wallet. Automation uses **ExecuteKey** (`0x03`) or **Session key** (`0x02`) — scoped credentials, not the EOA seed phrase / hardware key. |
+| **Bounded AI / agent automation** | `EchoPolicyValidator` enforces targets, selectors, budgets, recipient, and (for `0x02`) session caps; `PolicyRegistry.recordSpend` updates counters on success only. |
+
+Session mode (`0x02`) under EIP-7702 uses the **same** execution and funding model as realtime (`0x03`): **recipient must equal the EOA**, session budgets and ops limits apply; the agent may hold only the **session** material, within those caps until expiry or revoke.
 
 ### Contracts
 
 | Contract | Description |
 |---|---|
-| `PolicyRegistry` | Stores PolicyTemplates, PolicyInstances, SessionPolicies, and Execute Key hashes. The source of truth for all permission state. |
+| `PolicyRegistry` | PolicyTemplates, PolicyInstances, SessionPolicies, Execute Key hashes. Optional **one-time** `setOnboarding` for `EchoOnboarding`; optional legacy `setFactory` for `registerInstanceForStruct` (unused in default `Deploy.s.sol`). |
 | `IntentRegistry` | Immutable calldata decoder. Maps Uniswap V3 function selectors to semantic parameter positions (tokenIn, tokenOut, amountIn, recipient). |
-| `EchoPolicyValidator` | ERC-7579 type-1 validator module. Validates every UserOperation against MetaPolicy or SessionPolicy before execution. The final on-chain enforcer. |
-| `EchoAccount` | Concrete OZ AccountERC7579 subclass. Adds `initialize(userWallet, validator, instanceId)` for clone deployment. Deployed once as implementation; each user gets an EIP-1167 clone. |
-| `EchoAccountFactory` | Deploys an EchoAccount clone and registers a PolicyInstance in a single transaction. |
+| `EchoPolicyValidator` | **`validateFor7702`**: EIP-7702 entry — signature **`0x03`** (realtime ExecuteKey) or **`0x02`** (session). **`0x01`** rejected here. **`validateUserOp`**: ERC-7579 module path (e.g. tests / `MockAccount`) with `0x01` / `0x02`; **`0x03`** must use `validateFor7702`. |
+| `EchoDelegationModule` | EIP-7702 **delegation implementation**. EntryPoint v0.7 calls `validateUserOp` → `validator.validateFor7702`; `execute` uses ERC-7579-style single-call encoding. |
+| `EchoOnboarding` | One tx: `registerInstanceStructAsOnboarding` + `registerEip7702For`. Wired in `Deploy.s.sol` via `setOnboarding` + `setEip7702Onboarding`. |
+
+### Legacy vs current stack
+
+- **Removed from MVP:** `EchoAccount` (EIP-1167 clone) and `EchoAccountFactory` — they required swap liquidity on the **clone address** (`msg.sender` at the router).  
+- **Current:** deploy only registry, intent, validator, `EchoDelegationModule`, `EchoOnboarding` (see `script/Deploy.s.sol`). Gateway must send **`eip7702Auth`** with UserOps where the bundler supports it (e.g. Pimlico on Sepolia).
+
+### Where tokens live
+
+**EOA + EIP-7702:** Balances and router **approvals** stay on the user EOA. Paymaster can sponsor **gas**; that is separate from swap principal.
 
 ---
 
@@ -38,20 +57,27 @@ User
  ├─ IntentRegistry (on-chain, immutable)
  │    └─ decode(calldata) → (tokenIn, tokenOut, amountIn, recipient)
  │
- ├─ EchoAccount / AccountERC7579 (on-chain, per user — EIP-1167 clone)
- │    └─ EchoPolicyValidator installed as ERC-7579 module
- │         └─ validateUserOp()
- │              ├─ Mode 0x01 (real-time): validate against PolicyInstance
- │              └─ Mode 0x02 (session):   validate against SessionPolicy
+ ├─ User EOA + EIP-7702 → EchoDelegationModule (bundler passes eip7702Auth)
+ │    ├─ EchoOnboarding (optional): registerInstanceAndEip7702 — policy + EOA bind in 1 tx
+ │    └─ EchoPolicyValidator.validateFor7702 (mode `0x03` realtime or `0x02` session) + execute → DeFi (msg.sender = EOA)
  │
- └─ EchoAccountFactory (on-chain)
-      └─ createAccount(InstanceRegistration r, bytes32 salt)
-           → register PolicyInstance + deploy EchoAccount clone + initialize in one tx
+ └─ PolicyRegistry.registerInstanceStruct — user EOA registers policy when not using EchoOnboarding
 ```
 
 ### Request lifecycle
 
-**Real-time mode** (user present, immediate command):
+**EIP-7702 (default product path)** — `sender` is the user EOA, delegation points to `EchoDelegationModule`:
+
+```
+Realtime:  UserOperation.signature = [0x03][pad(executeKey, 32)]
+Session:   UserOperation.signature = [0x02][sessionId (32)][pad(sessionKey, 32)]
+(+ eip7702Auth on the bundler / RPC per Pimlico etc.)
+
+validateFor7702 → mode 0x03: same checks as real-time below; mode 0x02: same as session mode below (recipient == EOA, session caps, …)
+Mode 0x01 is rejected here (use validateUserOp only on a contract account).
+```
+
+**Real-time mode** (ERC-7579 module on a contract account — e.g. tests / integrations):
 ```
 UserOperation.signature = [0x01][pad(executeKey, 32)]
 
@@ -63,18 +89,18 @@ validateUserOp checks (in execution order):
   5.  target in allowedTargets
   6.  selector in allowedSelectors
   7.  IntentRegistry.decode(innerCalldata) → tokenIn, tokenOut, amountIn, recipient
-  8.  recipient == account (the smart account)
+  8.  recipient == account (the 4337 sender: **EOA** under EIP-7702, or smart account in module tests)
   9.  amountIn ≤ tokenLimits[tokenOut].maxPerOp  OR  ≤ explorationPerTx
   10. token daily cap not exceeded
   11. globalDailySpent + amountIn ≤ globalMaxPerDay
   12. globalTotalSpent + amountIn ≤ globalTotalBudget
 ```
 
-**Session mode** (user absent, autonomous task):
+**Session mode** — same checks whether entered via **`validateUserOp`** (module on a contract account, tests) or **`validateFor7702`** (EIP-7702, `account` = user EOA):
 ```
 UserOperation.signature = [0x02][sessionId (32b)][pad(sessionKey, 32b)]
 
-validateUserOp checks (in execution order):
+Checks (in execution order):
   1.  sessionKey hash valid
   2.  session belongs to this account's instance
   3.  session.active == true
@@ -83,7 +109,7 @@ validateUserOp checks (in execution order):
   6.  selector in allowedSelectors
   7.  tokenIn matches session
   8.  tokenOut matches session
-  9.  recipient == account (the smart account)
+  9.  recipient == account (the 4337 sender: **EOA** under EIP-7702, or smart account in module tests)
   10. amountIn ≤ session.maxAmountPerOp
   11. session.totalSpent + amountIn ≤ session.totalBudget
   12. session daily ops limit not exceeded
@@ -92,6 +118,23 @@ validateUserOp checks (in execution order):
 ```
 
 On `SIG_VALIDATION_SUCCESS`: `PolicyRegistry.recordSpend()` updates all spend counters atomically.
+
+### User onboarding (EIP-7702)
+
+1. **Deploy** (Echo team): `forge script script/Deploy.s.sol --rpc-url … --broadcast --verify`. Sets `validator`, `onboarding`, `EchoDelegationModule`; does **not** call `setFactory`.
+2. **Policy + bind (one tx, recommended):** user calls `EchoOnboarding.registerInstanceAndEip7702` with `InstanceRegistration.owner = msg.sender`.
+3. **Alternative (two txs):** `PolicyRegistry.registerInstanceStruct` then `EchoPolicyValidator.registerEip7702(instanceId)`.
+4. **Sessions:** instance **owner** (EOA) calls `PolicyRegistry.createSession(...)` when enabling unattended limits.
+5. **Automation:** user signs EIP-7702 **authorization** (implementation = deployed `EchoDelegationModule` address). Gateway submits `UserOperation` with `sender = user EOA`, **`eip7702Auth`**, and signature **`0x03`** (ExecuteKey) or **`0x02`** (session). Paymaster for gas.
+
+### Tests (high level)
+
+| Suite | Focus |
+|-------|--------|
+| `EchoDelegationModule.t.sol` | EIP-7702 `vm.signAndAttachDelegation`, `validateUserOp` via EntryPoint, **`0x03` and `0x02`**, `0x01` rejected, execute + mock router |
+| `EchoOnboarding.t.sol` | One-tx onboarding + wiring |
+| `EchoPolicyValidator.t.sol` | Module path `0x01` / `0x02`, `0x03` rejected on module `validateUserOp` |
+| `Integration.t.sol` | Mock account + policy flows (fork optional) |
 
 ---
 
@@ -168,7 +211,7 @@ The exploration budget provides a capped allowance for tokens not explicitly lis
 | Property | Description |
 |---|---|
 | S1 | No operation outside MetaPolicy or SessionPolicy can execute |
-| S2 | `recipient` in every swap must equal `AccountERC7579` — assets cannot go to third-party addresses |
+| S2 | `recipient` in every swap must equal the 4337 `sender` (EOA under EIP-7702) — assets cannot go to arbitrary third-party addresses |
 | S3 | `globalTotalSpent` and `session.totalSpent` are append-only — they can only increase |
 | S4 | Only the instance owner can modify PolicyInstance — agents cannot expand their own permissions |
 
@@ -184,9 +227,10 @@ Echo operates on bounded trust, not complete trustlessness.
 
 ### Known limitations
 
-- If the user's private key is stolen, an attacker can modify the PolicyInstance itself. Echo provides no protection at this level — it is equivalent to losing any smart wallet.
+- If the user's **EOA master key** is stolen, an attacker can change the PolicyInstance or revoke protections — same class of risk as any self-custody wallet.
+- **Session keys** (`0x02`): if disclosed, an attacker can spend **up to session + instance limits** until revoke or expiry. Scope session budgets and lifetimes accordingly.
 - Echo cannot prevent users from being socially engineered into approving a malicious policy update.
-- Assets held outside the user's AccountERC7579 are unaffected by Echo policies.
+- Assets held in unrelated wallets/contracts are unaffected by Echo policies.
 
 ---
 
@@ -197,8 +241,8 @@ Echo operates on bounded trust, not complete trustlessness.
 | PolicyRegistry | `TBD` |
 | IntentRegistry | `TBD` |
 | EchoPolicyValidator | `TBD` |
-| EchoAccount (impl) | `TBD` |
-| EchoAccountFactory | `TBD` |
+| EchoDelegationModule | `TBD` |
+| EchoOnboarding | `TBD` |
 
 ---
 
@@ -249,19 +293,20 @@ forge snapshot
 
 ```bash
 cp .env.example .env
-# Fill in SEPOLIA_RPC_URL, PRIVATE_KEY, ETHERSCAN_API_KEY
+# Required: DEPLOYER_PRIVATE_KEY, SEPOLIA_RPC_URL, ETHERSCAN_API_KEY (for verify)
 
 forge script script/Deploy.s.sol \
-  --rpc-url sepolia \
+  --rpc-url $SEPOLIA_RPC_URL \
   --broadcast \
-  --verify
+  --verify \
+  -vvvv
 ```
 
 ### Environment variables
 
 ```
 SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-PRIVATE_KEY=0x...
+DEPLOYER_PRIVATE_KEY=0x...    # registry owner + deployer (see Deploy.s.sol)
 ETHERSCAN_API_KEY=...
 ```
 
@@ -271,7 +316,7 @@ ETHERSCAN_API_KEY=...
 
 | Dependency | Purpose |
 |---|---|
-| OpenZeppelin Contracts v5 | AccountERC7579, Ownable, Initializable, SignerECDSA |
+| OpenZeppelin Contracts v5 | ERC-7579 utils, LowLevelCall, etc. (validator module pattern in tests) |
 | forge-std | Test utilities |
 
 ---
@@ -280,7 +325,7 @@ ETHERSCAN_API_KEY=...
 
 Internal security review by Dr. Jeff Ma (CTO). Formal third-party audit required before mainnet deployment.
 
-**Checklist items:** ERC-7562 storage compliance, reentrancy analysis, integer overflow (Solidity 0.8.24 checked arithmetic), S1–S4 invariants, bounded approvals, IntentRegistry fuzz testing, onInstall ownership enforcement, session subset re-verification.
+**Checklist items:** ERC-7562 storage compliance, reentrancy analysis, integer overflow (Solidity 0.8.x checked arithmetic), S1–S4 invariants, bounded approvals, IntentRegistry fuzz testing, EIP-7702 (`validateFor7702` **0x03 / 0x02**, `eip7702Auth` integration off-chain), `EchoOnboarding` + `setOnboarding` / `setEip7702Onboarding`, session subset re-verification.
 
 ---
 
