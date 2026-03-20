@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-interface IERC20 {
+interface IMockToken {
     function transferFrom(address, address, uint256) external returns (bool);
     function mint(address, uint256) external;
     function balanceOf(address) external view returns (uint256);
@@ -56,9 +56,9 @@ contract MockSwapRouter {
         require(amountOut >= params.amountOutMinimum, "MockRouter: slippage");
 
         // Pull tokenIn from caller
-        IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        IMockToken(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
         // Mint tokenOut to recipient
-        IERC20(params.tokenOut).mint(params.recipient, amountOut);
+        IMockToken(params.tokenOut).mint(params.recipient, amountOut);
 
         emit Swap(params.tokenIn, params.tokenOut, params.recipient, params.amountIn, amountOut);
     }
@@ -84,9 +84,9 @@ contract MockSwapRouter {
         require(amountIn <= params.amountInMaximum, "MockRouter: amountInMaximum exceeded");
 
         // Pull tokenIn from caller
-        IERC20(params.tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        IMockToken(params.tokenIn).transferFrom(msg.sender, address(this), amountIn);
         // Mint tokenOut to recipient
-        IERC20(params.tokenOut).mint(params.recipient, params.amountOut);
+        IMockToken(params.tokenOut).mint(params.recipient, params.amountOut);
 
         emit Swap(params.tokenIn, params.tokenOut, params.recipient, amountIn, params.amountOut);
     }
