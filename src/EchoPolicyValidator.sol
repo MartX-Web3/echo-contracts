@@ -28,6 +28,8 @@ contract EchoPolicyValidator {
 
     uint8   private constant MODE_REALTIME   = 0x01;
     uint8   private constant MODE_SESSION    = 0x02;
+    /// @dev EIP-7702 hybrid account: validated via {validateFor7702} (caller must be `userOp.sender`).
+    uint8   private constant MODE_EIP7702    = 0x03;
     uint256 private constant SECONDS_PER_DAY = 86400;
     uint256 private constant SIG_SUCCESS     = 0;
     uint256 private constant SIG_FAILED      = 1;
@@ -38,6 +40,9 @@ contract EchoPolicyValidator {
 
     IPolicyRegistry public immutable registry;
     IIntentRegistry public immutable intentRegistry;
+
+    /// @dev Trusted {EchoOnboarding} helper; set once by registry admin via {setEip7702Onboarding}.
+    address public eip7702Onboarding;
 
     mapping(address account => bytes32 instanceId) private _accountInstance;
     mapping(address account => uint256 lastOpTimestamp) private _lastOpTimestamp;
@@ -61,6 +66,13 @@ contract EchoPolicyValidator {
         require(_intentRegistry != address(0), "Zero intentRegistry");
         registry       = IPolicyRegistry(_registry);
         intentRegistry = IIntentRegistry(_intentRegistry);
+    }
+
+    /// @notice Wire {EchoOnboarding} after deploy (registry `owner` only, once).
+    function setEip7702Onboarding(address o) external {
+        require(msg.sender == registry.owner(), "Not registry owner");
+        require(eip7702Onboarding == address(0) && o != address(0), "Onboarding already set or zero");
+        eip7702Onboarding = o;
     }
 
     // ── ERC-7579 module ────────────────────────────────────────────────────
@@ -90,6 +102,69 @@ contract EchoPolicyValidator {
         return _accountInstance[account] != bytes32(0);
     }
 
+    /// @notice Bind an EOA (`msg.sender`) to a PolicyInstance for EIP-7702 delegation flows.
+    /// @dev    Replaces smart-account `onInstall`: registry `instance.owner` must be this EOA.
+    function registerEip7702(bytes32 instanceId) external {
+        _bindEip7702(instanceId, msg.sender);
+    }
+
+    /// @notice Same as {registerEip7702} but callable only by {EchoOnboarding} for one-tx onboarding.
+    function registerEip7702For(address account, bytes32 instanceId) external {
+        require(msg.sender == eip7702Onboarding, "registerEip7702For: not onboarding");
+        _bindEip7702(instanceId, account);
+    }
+
+    function _bindEip7702(bytes32 instanceId, address account) private {
+        require(instanceId != bytes32(0), "registerEip7702: zero instanceId");
+        IPolicyRegistry.PolicyInstance memory inst = registry.getInstance(instanceId);
+        require(inst.exists, "registerEip7702: unknown instance");
+        require(inst.owner == account, "registerEip7702: not instance owner");
+        _accountInstance[account] = instanceId;
+    }
+
+    /// @notice ERC-4337 validation entry used when `userOp.sender` is an EOA with EIP-7702 code
+    ///         pointing at {EchoDelegationModule}. Must be called with `msg.sender == userOp.sender`.
+    /// @dev    Signature modes: `0x03` (MODE_EIP7702) → real-time ExecuteKey path; `0x02` (MODE_SESSION) → session path.
+    ///         Mode `0x01` must use {validateUserOp} on a contract account, not this entry.
+    function validateFor7702(
+        PackedUserOperation calldata userOp,
+        bytes32 /*userOpHash*/
+    ) external returns (uint256) {
+        address account = userOp.sender;
+        if (msg.sender != account) {
+            emit ValidationFailed(account, bytes32(0), "EIP-7702: caller not sender");
+            return SIG_FAILED;
+        }
+
+        bytes calldata sig = userOp.signature;
+        if (sig.length < 33) {
+            emit ValidationFailed(account, bytes32(0), "Signature too short");
+            return SIG_FAILED;
+        }
+
+        uint8 mode = uint8(sig[0]);
+        if (mode != MODE_EIP7702 && mode != MODE_SESSION) {
+            emit ValidationFailed(account, bytes32(0), "EIP-7702: bad mode");
+            return SIG_FAILED;
+        }
+
+        bytes32 instanceId = _accountInstance[account];
+        if (instanceId == bytes32(0)) {
+            emit ValidationFailed(account, bytes32(0), "No EIP-7702 registration");
+            return SIG_FAILED;
+        }
+
+        if (mode == MODE_EIP7702) {
+            return _validateRealtime(account, instanceId, userOp);
+        }
+
+        if (sig.length < 65) {
+            emit ValidationFailed(account, instanceId, "Session sig too short");
+            return SIG_FAILED;
+        }
+        return _validateSession(account, instanceId, userOp);
+    }
+
     // ── validateUserOp ─────────────────────────────────────────────────────
 
     function validateUserOp(
@@ -112,6 +187,10 @@ contract EchoPolicyValidator {
 
         uint8 mode = uint8(sig[0]);
 
+        if (mode == MODE_EIP7702) {
+            emit ValidationFailed(account, instanceId, "EIP-7702: use validateFor7702");
+            return SIG_FAILED;
+        }
         if (mode == MODE_REALTIME) {
             return _validateRealtime(account, instanceId, userOp);
         }
