@@ -33,7 +33,7 @@ Session mode (`0x02`) under EIP-7702 uses the **same** execution and funding mod
 ### Legacy vs current stack
 
 - **Removed from MVP:** `EchoAccount` (EIP-1167 clone) and `EchoAccountFactory` — they required swap liquidity on the **clone address** (`msg.sender` at the router).  
-- **Current:** deploy only registry, intent, validator, `EchoDelegationModule`, `EchoOnboarding` (see `script/Deploy.s.sol`). Gateway must send **`eip7702Auth`** with UserOps where the bundler supports it (e.g. Pimlico on Sepolia).
+- **Current:** deploy only registry, intent, validator, `EchoDelegationModule`, `EchoOnboarding` (see `script/Deploy.s.sol`). Gateway must send **`eip7702Auth`** with UserOps where the bundler supports it (e.g. Pimlico on Sepolia). **Gateway integration notes:** [`docs/GATEWAY_7702_CHANGES.md`](docs/GATEWAY_7702_CHANGES.md).
 
 ### Where tokens live
 
