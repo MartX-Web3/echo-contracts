@@ -262,6 +262,7 @@ contract EchoDelegationModuleTest is Test {
             tokenOut: address(usdc),
             fee: uint24(3000),
             recipient: owner,
+            deadline: block.timestamp + 300,
             amountIn: amt,
             amountOutMinimum: 0,
             sqrtPriceLimitX96: 0
